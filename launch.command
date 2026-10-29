@@ -72,17 +72,34 @@ launch_browser() {
   exec "$browser" "$@"
 }
 
-tor_browser_running() {
-  pgrep -f "$TOR_PROCESS_PATTERN" >/dev/null 2>&1 ||
-    pgrep -f "$TOR_TOR_PATTERN" >/dev/null 2>&1
+browser_running() {
+  pgrep -f "$TOR_PROCESS_PATTERN" >/dev/null 2>&1
+}
+
+tor_running() {
+  pgrep -f "$TOR_TOR_PATTERN" >/dev/null 2>&1
 }
 
 stop_tor_browser() {
-  tor_browser_running || return 0
+  if browser_running; then
+    osascript -e 'tell application "Tor Browser" to quit' >/dev/null 2>&1 || true
+    for _ in {1..30}; do
+      browser_running || break
+      sleep 1
+    done
+    if browser_running; then
+      return 1
+    fi
+  fi
 
-  osascript -e 'tell application "Tor Browser" to quit' >/dev/null 2>&1 || true
-  for _ in {1..30}; do
-    tor_browser_running || return 0
+  for _ in {1..5}; do
+    tor_running || return 0
+    sleep 1
+  done
+
+  pkill -TERM -f "$TOR_TOR_PATTERN" >/dev/null 2>&1 || true
+  for _ in {1..10}; do
+    tor_running || return 0
     sleep 1
   done
   return 1
@@ -244,7 +261,7 @@ browser="$(find_tor_browser)" || {
 TOR_PROCESS_PATTERN="$browser"
 TOR_TOR_PATTERN="$(dirname "$browser")/Tor/tor"
 
-if [ -n "$KIOSK_FLAG" ] && tor_browser_running; then
+if [ -n "$KIOSK_FLAG" ] && { browser_running || tor_running; }; then
   stop_tor_browser || {
     say_error "Tor Browser is still running. Quit it and open Silk Chat again."
     exit 1
