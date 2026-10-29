@@ -14,7 +14,7 @@ esac
 ONION_FILE="${SILK_CHAT_ONION_FILE:-$HOME/.config/silk-chat/onion}"
 TOR_APP_FILE="${SILK_CHAT_TOR_APP_FILE:-$HOME/.config/silk-chat/tor-browser-app}"
 TOR_PROFILE="${SILK_CHAT_TOR_PROFILE:-$HOME/.config/silk-chat/tor-profile}"
-KIOSK_FLAG="${SILK_CHAT_KIOSK_FLAG--kiosk}"
+KIOSK_FLAG="${SILK_CHAT_KIOSK_FLAG-}"
 TOR_APP_ALT="$HOME/Applications/Tor Browser.app"
 
 LAUNCHER_SIGNING_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILvj4ZhAL+Jve263cPzibOBvqrSHLf20FqJ5nev1l/dq"
@@ -261,7 +261,7 @@ browser="$(find_tor_browser)" || {
 TOR_PROCESS_PATTERN="$browser"
 TOR_TOR_PATTERN="$(dirname "$browser")/Tor/tor"
 
-if [ -n "$KIOSK_FLAG" ] && { browser_running || tor_running; }; then
+if browser_running || tor_running; then
   stop_tor_browser || {
     say_error "Tor Browser is still running. Quit it and open Silk Chat again."
     exit 1
