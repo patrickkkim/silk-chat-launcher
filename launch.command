@@ -64,6 +64,14 @@ find_tor_browser() {
   return 1
 }
 
+launch_browser() {
+  if [ "$(uname -m)" = "arm64" ] && [ -x /usr/bin/arch ] &&
+    /usr/bin/lipo -archs "$browser" 2>/dev/null | tr ' ' '\n' | grep -qx arm64; then
+    exec /usr/bin/arch -arm64 "$browser" "$@"
+  fi
+  exec "$browser" "$@"
+}
+
 tor_browser_running() {
   pgrep -f "$TOR_PROCESS_PATTERN" >/dev/null 2>&1 ||
     pgrep -f "$TOR_TOR_PATTERN" >/dev/null 2>&1
@@ -73,14 +81,7 @@ stop_tor_browser() {
   tor_browser_running || return 0
 
   osascript -e 'tell application "Tor Browser" to quit' >/dev/null 2>&1 || true
-  for _ in {1..10}; do
-    tor_browser_running || return 0
-    sleep 1
-  done
-
-  pkill -TERM -f "$TOR_PROCESS_PATTERN" >/dev/null 2>&1 || true
-  pkill -TERM -f "$TOR_TOR_PATTERN" >/dev/null 2>&1 || true
-  for _ in {1..10}; do
+  for _ in {1..30}; do
     tor_browser_running || return 0
     sleep 1
   done
@@ -256,7 +257,7 @@ if [ "${SILK_CHAT_DISABLE_UPDATE:-}" != "1" ]; then
 fi
 
 if [ -n "$KIOSK_FLAG" ]; then
-  exec "$browser" -profile "$TOR_PROFILE" "$KIOSK_FLAG" "http://$onion"
+  launch_browser -profile "$TOR_PROFILE" "$KIOSK_FLAG" "http://$onion"
 else
-  exec "$browser" -profile "$TOR_PROFILE" "http://$onion"
+  launch_browser -profile "$TOR_PROFILE" "http://$onion"
 fi
