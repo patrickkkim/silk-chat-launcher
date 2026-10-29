@@ -326,11 +326,6 @@ fi
 
 trap stop_local_proxy EXIT
 
-if [ "${SILK_CHAT_DISABLE_UPDATE:-}" != "1" ]; then
-  mkdir -p "$(dirname "$UPDATE_LOG")" 2>/dev/null || true
-  update_launcher >> "$UPDATE_LOG" 2>&1 &
-fi
-
 if start_local_proxy; then
   browser_url="$local_url"
 else
@@ -343,4 +338,14 @@ else
   launch_browser -profile "$TOR_PROFILE" "$browser_url" &
 fi
 browser_pid=$!
+
+if [ "${SILK_CHAT_DISABLE_UPDATE:-}" != "1" ]; then
+  mkdir -p "$(dirname "$UPDATE_LOG")" 2>/dev/null || true
+  (
+    sleep 60
+    kill -0 "$browser_pid" 2>/dev/null || exit 0
+    update_launcher
+  ) >> "$UPDATE_LOG" 2>&1 &
+fi
+
 wait "$browser_pid"
