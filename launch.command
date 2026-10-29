@@ -28,6 +28,7 @@ UPDATE_BASE_URL="${SILK_CHAT_UPDATE_BASE_URL:-https://github.com/patrickkkim/sil
 UPDATE_CHECK_FILE="${SILK_CHAT_UPDATE_CHECK_FILE:-$HOME/.config/silk-chat/last-launcher-check}"
 UPDATE_VERSION_FILE="${SILK_CHAT_UPDATE_VERSION_FILE:-$HOME/.config/silk-chat/launcher-version}"
 UPDATE_LOG="${SILK_CHAT_UPDATE_LOG:-$HOME/Library/Logs/Silk Chat/updater.log}"
+SESSION_FILE="${SILK_CHAT_SESSION_FILE:-$HOME/.config/silk-chat/session}"
 UPDATE_INTERVAL=86400
 
 say_error() {
@@ -79,11 +80,11 @@ launch_browser() {
 }
 
 browser_running() {
-  pgrep -f "$TOR_PROCESS_PATTERN" >/dev/null 2>&1
+  pgrep -f "^${TOR_PROCESS_PATTERN}" >/dev/null 2>&1
 }
 
 tor_running() {
-  pgrep -f "$TOR_TOR_PATTERN" >/dev/null 2>&1
+  pgrep -f "^${TOR_TOR_PATTERN}" >/dev/null 2>&1
 }
 
 stop_tor_browser() {
@@ -121,6 +122,64 @@ stop_local_proxy() {
     rm -f "$local_handshake"
     local_handshake=""
   fi
+}
+
+write_session_file() {
+  local pid="$1" app="$2" url="$3" tmp
+  if [ -z "${SESSION_FILE:-}" ] || [ -z "$pid" ] || [ -z "$app" ] || [ -z "$url" ]; then
+    return 0
+  fi
+
+  tmp="$SESSION_FILE.tmp.$$"
+  mkdir -p "$(dirname "$SESSION_FILE")" 2>/dev/null || return 0
+  (umask 077 && printf '%s\n%s\n%s\n%s\n' "$$" "$pid" "$app" "$url" > "$tmp") || {
+    rm -f "$tmp"
+    return 0
+  }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$SESSION_FILE" 2>/dev/null || rm -f "$tmp"
+}
+
+clear_session_file() {
+  local owner
+  if [ -z "${SESSION_FILE:-}" ] || [ ! -f "$SESSION_FILE" ]; then
+    return 0
+  fi
+  owner="$(sed -n '1p' "$SESSION_FILE" 2>/dev/null || true)"
+  if [ "$owner" != "$$" ]; then
+    return 0
+  fi
+  rm -f "$SESSION_FILE"
+}
+
+set_session_homepage() {
+  local url="$1"
+  local user_js="$TOR_PROFILE/user.js"
+  local tmp="$TOR_PROFILE/user.js.tmp.$$"
+
+  [ -f "$user_js" ] || return 0
+  awk -v url="$url" '
+    $0 == "// BEGIN SILK CHAT HOMEPAGE" { skip = 1; next }
+    $0 == "// END SILK CHAT HOMEPAGE" { skip = 0; next }
+    skip { next }
+    { print }
+    END {
+      print "// BEGIN SILK CHAT HOMEPAGE"
+      printf "user_pref(\"browser.startup.page\", 1);\n"
+      printf "user_pref(\"browser.startup.homepage\", \"%s\");\n", url
+      print "// END SILK CHAT HOMEPAGE"
+    }
+  ' "$user_js" > "$tmp" 2>/dev/null || {
+    rm -f "$tmp"
+    return 0
+  }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$user_js" 2>/dev/null || rm -f "$tmp"
+}
+
+cleanup() {
+  stop_local_proxy
+  clear_session_file
 }
 
 start_local_proxy() {
@@ -314,6 +373,7 @@ browser="$(find_tor_browser)" || {
   say_error "Tor Browser is not installed. Run the Silk Chat installer again."
   exit 1
 }
+browser_app="$(cd "$(dirname "$browser")/../.." && pwd)"
 TOR_PROCESS_PATTERN="$browser"
 TOR_TOR_PATTERN="$(dirname "$browser")/Tor/tor"
 
@@ -324,7 +384,10 @@ if browser_running || tor_running; then
   }
 fi
 
-trap stop_local_proxy EXIT
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if start_local_proxy; then
   browser_url="$local_url"
@@ -332,12 +395,15 @@ else
   browser_url="http://$onion"
 fi
 
+set_session_homepage "$browser_url"
+
 if [ -n "$KIOSK_FLAG" ]; then
   launch_browser -profile "$TOR_PROFILE" "$KIOSK_FLAG" "$browser_url" &
 else
   launch_browser -profile "$TOR_PROFILE" "$browser_url" &
 fi
 browser_pid=$!
+write_session_file "$browser_pid" "$browser_app" "$browser_url"
 
 if [ "${SILK_CHAT_DISABLE_UPDATE:-}" != "1" ]; then
   mkdir -p "$(dirname "$UPDATE_LOG")" 2>/dev/null || true
