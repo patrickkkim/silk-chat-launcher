@@ -16,6 +16,12 @@ TOR_APP_FILE="${SILK_CHAT_TOR_APP_FILE:-$HOME/.config/silk-chat/tor-browser-app}
 TOR_PROFILE="${SILK_CHAT_TOR_PROFILE:-$HOME/.config/silk-chat/tor-profile}"
 KIOSK_FLAG="${SILK_CHAT_KIOSK_FLAG-}"
 TOR_APP_ALT="$HOME/Applications/Tor Browser.app"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROXY_BIN="${SILK_CHAT_PROXY_BIN:-$SCRIPT_DIR/silk-chat-proxy}"
+WEBUI_DIR="${SILK_CHAT_WEBUI_DIR:-$SCRIPT_DIR/webui}"
+local_proxy_pid=""
+local_handshake=""
+local_url=""
 
 LAUNCHER_SIGNING_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILvj4ZhAL+Jve263cPzibOBvqrSHLf20FqJ5nev1l/dq"
 UPDATE_BASE_URL="${SILK_CHAT_UPDATE_BASE_URL:-https://github.com/patrickkkim/silk-chat-launcher/releases/download/launcher-latest}"
@@ -103,6 +109,56 @@ stop_tor_browser() {
     sleep 1
   done
   return 1
+}
+
+stop_local_proxy() {
+  if [ -n "${local_proxy_pid:-}" ]; then
+    kill "$local_proxy_pid" 2>/dev/null || true
+    wait "$local_proxy_pid" 2>/dev/null || true
+    local_proxy_pid=""
+  fi
+  if [ -n "${local_handshake:-}" ]; then
+    rm -f "$local_handshake"
+    local_handshake=""
+  fi
+}
+
+start_local_proxy() {
+  local_handshake="${TMPDIR:-/tmp}/silk-chat-proxy.$$"
+  local_url=""
+
+  [ "${SILK_CHAT_DISABLE_LOCAL_UI:-}" != "1" ] || return 1
+  [ -x "$PROXY_BIN" ] && [ -f "$WEBUI_DIR/index.html" ] || return 1
+
+  rm -f "$local_handshake"
+  "$PROXY_BIN" \
+    --static-dir "$WEBUI_DIR" \
+    --onion-file "$ONION_FILE" \
+    --handshake "$local_handshake" \
+    --tor-socks 127.0.0.1:9150 >/dev/null 2>&1 &
+  local_proxy_pid=$!
+
+  for _ in {1..50}; do
+    [ -s "$local_handshake" ] && break
+    kill -0 "$local_proxy_pid" 2>/dev/null || break
+    sleep 0.1
+  done
+
+  if [ ! -s "$local_handshake" ]; then
+    stop_local_proxy
+    return 1
+  fi
+
+  local port token
+  read -r port token < "$local_handshake"
+  rm -f "$local_handshake"
+  local_handshake=""
+  if ! [[ "$port" =~ ^[0-9]+$ && "$token" =~ ^[0-9a-f]{64}$ ]]; then
+    stop_local_proxy
+    return 1
+  fi
+  local_url="http://127.0.0.1:$port/__silk__/$token"
+  return 0
 }
 
 log_update() {
@@ -268,13 +324,23 @@ if browser_running || tor_running; then
   }
 fi
 
+trap stop_local_proxy EXIT
+
 if [ "${SILK_CHAT_DISABLE_UPDATE:-}" != "1" ]; then
   mkdir -p "$(dirname "$UPDATE_LOG")" 2>/dev/null || true
   update_launcher >> "$UPDATE_LOG" 2>&1 &
 fi
 
-if [ -n "$KIOSK_FLAG" ]; then
-  launch_browser -profile "$TOR_PROFILE" "$KIOSK_FLAG" "http://$onion"
+if start_local_proxy; then
+  browser_url="$local_url"
 else
-  launch_browser -profile "$TOR_PROFILE" "http://$onion"
+  browser_url="http://$onion"
 fi
+
+if [ -n "$KIOSK_FLAG" ]; then
+  launch_browser -profile "$TOR_PROFILE" "$KIOSK_FLAG" "$browser_url" &
+else
+  launch_browser -profile "$TOR_PROFILE" "$browser_url" &
+fi
+browser_pid=$!
+wait "$browser_pid"
