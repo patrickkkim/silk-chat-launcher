@@ -16,9 +16,6 @@ TOR_APP_FILE="${SILK_CHAT_TOR_APP_FILE:-$HOME/.config/silk-chat/tor-browser-app}
 TOR_PROFILE="${SILK_CHAT_TOR_PROFILE:-$HOME/.config/silk-chat/tor-profile}"
 KIOSK_FLAG="${SILK_CHAT_KIOSK_FLAG-}"
 TOR_APP_ALT="$HOME/Applications/Tor Browser.app"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SPLASH_BIN="${SILK_CHAT_SPLASH_BIN:-$SCRIPT_DIR/silk-chat-splash}"
-SPLASH_HTML="${SILK_CHAT_SPLASH_HTML:-$SCRIPT_DIR/Splash.html}"
 
 LAUNCHER_SIGNING_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILvj4ZhAL+Jve263cPzibOBvqrSHLf20FqJ5nev1l/dq"
 UPDATE_BASE_URL="${SILK_CHAT_UPDATE_BASE_URL:-https://github.com/patrickkkim/silk-chat-launcher/releases/download/launcher-latest}"
@@ -106,48 +103,6 @@ stop_tor_browser() {
     sleep 1
   done
   return 1
-}
-
-chat_ready() {
-  /usr/bin/nc -z 127.0.0.1 9150 >/dev/null 2>&1 || return 1
-  local code
-  code="$(/usr/bin/curl -sS --max-time 8 --socks5-hostname 127.0.0.1:9150 \
-    -o /dev/null -w '%{http_code}' "http://$onion/" 2>/dev/null || true)"
-  [ "$code" = "200" ]
-}
-
-wait_for_chat() {
-  for _ in {1..90}; do
-    kill -0 "$browser_pid" 2>/dev/null || return 1
-    chat_ready && return 0
-    sleep 1
-  done
-  return 1
-}
-
-start_splash() {
-  [ "${SILK_CHAT_DISABLE_SPLASH:-}" != "1" ] || return 0
-  [ -x "$SPLASH_BIN" ] && [ -f "$SPLASH_HTML" ] || return 0
-
-  splash_ready="${TMPDIR:-/tmp}/silk-chat-splash-ready.$$"
-  rm -f "$splash_ready"
-  "$SPLASH_BIN" "$SPLASH_HTML" "$(dirname "$SPLASH_HTML")" "$splash_ready" \
-    >/dev/null 2>&1 &
-  splash_pid=$!
-
-  for _ in {1..25}; do
-    [ -f "$splash_ready" ] && break
-    kill -0 "$splash_pid" 2>/dev/null || break
-    sleep 0.1
-  done
-  rm -f "$splash_ready"
-}
-
-stop_splash() {
-  [ -n "${splash_pid:-}" ] || return 0
-  kill "$splash_pid" 2>/dev/null || true
-  wait "$splash_pid" 2>/dev/null || true
-  splash_pid=""
 }
 
 log_update() {
@@ -313,27 +268,13 @@ if browser_running || tor_running; then
   }
 fi
 
-splash_pid=""
-trap stop_splash EXIT
-
 if [ "${SILK_CHAT_DISABLE_UPDATE:-}" != "1" ]; then
   mkdir -p "$(dirname "$UPDATE_LOG")" 2>/dev/null || true
   update_launcher >> "$UPDATE_LOG" 2>&1 &
 fi
 
-start_splash
-
 if [ -n "$KIOSK_FLAG" ]; then
-  launch_browser -profile "$TOR_PROFILE" "$KIOSK_FLAG" "http://$onion" &
+  launch_browser -profile "$TOR_PROFILE" "$KIOSK_FLAG" "http://$onion"
 else
-  launch_browser -profile "$TOR_PROFILE" "http://$onion" &
+  launch_browser -profile "$TOR_PROFILE" "http://$onion"
 fi
-browser_pid=$!
-
-if [ -n "${splash_pid:-}" ]; then
-  wait_for_chat || true
-  stop_splash
-  osascript -e 'tell application "Tor Browser" to activate' >/dev/null 2>&1 || true
-fi
-
-wait "$browser_pid"
