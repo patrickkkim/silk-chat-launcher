@@ -48,6 +48,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [ ! -f launch.command ] || [ ! -f manifest.txt ] || [ ! -f manifest.txt.sig ]; then
+            echo "No launcher artifacts in this commit; nothing to publish."
+            exit 0
+          fi
           version="$(sed -n 's/^version=//p' manifest.txt | head -1)"
           base="https://github.com/${{ github.repository }}/releases/download/launcher-latest"
           latest="$(curl -fsSL "$base/manifest.txt" 2>/dev/null | sed -n 's/^version=//p' | head -1 || true)"
