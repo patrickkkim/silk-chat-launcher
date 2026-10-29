@@ -29,6 +29,8 @@ UPDATE_CHECK_FILE="${SILK_CHAT_UPDATE_CHECK_FILE:-$HOME/.config/silk-chat/last-l
 UPDATE_VERSION_FILE="${SILK_CHAT_UPDATE_VERSION_FILE:-$HOME/.config/silk-chat/launcher-version}"
 UPDATE_LOG="${SILK_CHAT_UPDATE_LOG:-$HOME/Library/Logs/Silk Chat/updater.log}"
 SESSION_FILE="${SILK_CHAT_SESSION_FILE:-$HOME/.config/silk-chat/session}"
+PENDING_RESOURCES="${SILK_CHAT_PENDING_RESOURCES:-$HOME/.config/silk-chat/pending-resources}"
+ROLLBACK_RESOURCES="${SILK_CHAT_ROLLBACK_RESOURCES:-$HOME/.config/silk-chat/rollback-resources}"
 UPDATE_INTERVAL=86400
 
 say_error() {
@@ -225,6 +227,75 @@ log_update() {
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$UPDATE_LOG" 2>/dev/null || true
 }
 
+valid_sha() {
+  case "$1" in
+    ''|*[!0-9a-f]*) return 1 ;;
+  esac
+  [ "${#1}" -eq 64 ]
+}
+
+apply_pending_resources() {
+  local resources_dir pending rollback
+  resources_dir="$(cd "$(dirname "$0")" && pwd)" || return 0
+  case "$resources_dir" in
+    */Contents/Resources) ;;
+    *) return 0 ;;
+  esac
+
+  pending="$PENDING_RESOURCES"
+  [ -f "$pending/webui/index.html" ] || return 0
+  [ -x "$pending/silk-chat-proxy" ] || return 0
+  [ -f "$pending/webui-version.txt" ] || return 0
+
+  rollback="$ROLLBACK_RESOURCES"
+  rm -rf "$rollback" 2>/dev/null || true
+  mkdir -p "$rollback" || {
+    log_update "could not create the resource rollback directory"
+    return 0
+  }
+
+  log_update "applying staged frontend and proxy"
+  if ! mv "$resources_dir/webui" "$rollback/webui" 2>/dev/null; then
+    log_update "could not stage the current frontend"
+    rm -rf "$rollback"
+    return 0
+  fi
+  if ! mv "$resources_dir/silk-chat-proxy" "$rollback/silk-chat-proxy" 2>/dev/null; then
+    mv "$rollback/webui" "$resources_dir/webui" 2>/dev/null || true
+    log_update "could not stage the current proxy"
+    rm -rf "$rollback"
+    return 0
+  fi
+  if [ -f "$resources_dir/webui-version.txt" ]; then
+    mv "$resources_dir/webui-version.txt" "$rollback/webui-version.txt" 2>/dev/null || true
+  fi
+
+  if ! mv "$pending/webui" "$resources_dir/webui" 2>/dev/null; then
+    mv "$rollback/webui" "$resources_dir/webui" 2>/dev/null || true
+    mv "$rollback/silk-chat-proxy" "$resources_dir/silk-chat-proxy" 2>/dev/null || true
+    if [ -f "$rollback/webui-version.txt" ]; then
+      mv "$rollback/webui-version.txt" "$resources_dir/webui-version.txt" 2>/dev/null || true
+    fi
+    log_update "could not apply the staged frontend"
+    return 0
+  fi
+  if ! mv "$pending/silk-chat-proxy" "$resources_dir/silk-chat-proxy" 2>/dev/null; then
+    rm -rf "$resources_dir/webui" 2>/dev/null || true
+    mv "$rollback/webui" "$resources_dir/webui" 2>/dev/null || true
+    mv "$rollback/silk-chat-proxy" "$resources_dir/silk-chat-proxy" 2>/dev/null || true
+    if [ -f "$rollback/webui-version.txt" ]; then
+      mv "$rollback/webui-version.txt" "$resources_dir/webui-version.txt" 2>/dev/null || true
+    fi
+    log_update "could not apply the staged proxy"
+    return 0
+  fi
+  chmod 755 "$resources_dir/silk-chat-proxy" 2>/dev/null || true
+  mv "$pending/webui-version.txt" "$resources_dir/webui-version.txt" 2>/dev/null || true
+  rm -rf "$pending"
+
+  log_update "frontend and proxy updated from staged release"
+}
+
 self_update_due() {
   local now last=0
   now="$(date +%s)"
@@ -265,7 +336,7 @@ update_launcher() {
   if [ -f "$UPDATE_LOG" ] && [ "$(wc -c < "$UPDATE_LOG" 2>/dev/null || echo 0)" -gt 1048576 ]; then
     mv "$UPDATE_LOG" "$UPDATE_LOG.1" 2>/dev/null || true
   fi
-  log_update "checking for launcher updates"
+  log_update "checking for updates"
 
   (
     work="$(mktemp -d "${TMPDIR:-/tmp}/silk-chat-update.XXXXXX")" || exit 0
@@ -286,11 +357,6 @@ update_launcher() {
       log_update "signature download failed"
       exit 0
     }
-    curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 45 --retry 2 \
-      "$UPDATE_BASE_URL/launch.command" -o "$work/launch.command" || {
-      log_update "launcher download failed"
-      exit 0
-    }
 
     printf 'silk-chat-launcher %s\n' "$LAUNCHER_SIGNING_KEY" > "$work/allowed_signers"
     if ! /usr/bin/ssh-keygen -Y verify \
@@ -304,22 +370,33 @@ update_launcher() {
 
     version="$(sed -n 's/^version=//p' "$work/manifest.txt" | head -1)"
     sha="$(sed -n 's/^sha256=//p' "$work/manifest.txt" | head -1)"
+    server_version="$(sed -n 's/^server_version=//p' "$work/manifest.txt" | head -1)"
+    resources_version="$(sed -n 's/^resources_version=//p' "$work/manifest.txt" | head -1)"
+    webui_sha="$(sed -n 's/^webui_sha256=//p' "$work/manifest.txt" | head -1)"
+    proxy_sha="$(sed -n 's/^proxy_sha256=//p' "$work/manifest.txt" | head -1)"
+
     case "$version" in
       ''|*[!0-9]*) log_update "manifest version is invalid"; exit 0 ;;
     esac
-    case "$sha" in
-      ''|*[!0-9a-f]*) log_update "manifest hash is invalid"; exit 0 ;;
-    esac
-    if [ "${#sha}" -ne 64 ]; then
-      log_update "manifest hash is invalid"
+    if ! valid_sha "$sha"; then
+      log_update "launcher hash is invalid"
       exit 0
     fi
-
-    actual="$(shasum -a 256 "$work/launch.command" | awk '{print $1}')"
-    if [ "$actual" != "$sha" ]; then
-      log_update "launcher hash does not match the manifest"
-      exit 0
+    if [ -n "$server_version" ]; then
+      case "$server_version" in
+        ''|*[!0-9.]*|.*|*.) log_update "server version is invalid"; server_version="" ;;
+      esac
     fi
+    for candidate in "$resources_version" "$webui_sha" "$proxy_sha"; do
+      if [ -n "$candidate" ] && ! valid_sha "$candidate"; then
+        log_update "resource manifest hash is invalid"
+        resources_version=""
+        webui_sha=""
+        proxy_sha=""
+        server_version=""
+        break
+      fi
+    done
 
     current=0
     if [ -f "$UPDATE_VERSION_FILE" ]; then
@@ -328,30 +405,138 @@ update_launcher() {
         ''|*[!0-9]*) current=0 ;;
       esac
     fi
-    if [ "$version" -le "$current" ]; then
-      log_update "launcher is up to date at version $current"
+    launcher_needed=0
+    [ "$version" -gt "$current" ] && launcher_needed=1
+
+    resources_needed=0
+    if [ -n "$resources_version" ] && [ -n "$server_version" ] &&
+      [ -n "$webui_sha" ] && [ -n "$proxy_sha" ]; then
+      current_resources=""
+      if [ -f "$resources_dir/webui-version.txt" ]; then
+        current_resources="$(shasum -a 256 "$resources_dir/webui-version.txt" | awk '{print $1}')"
+      fi
+      if [ "$current_resources" != "$resources_version" ]; then
+        resources_needed=1
+      fi
+    fi
+
+    if [ "$launcher_needed" -eq 0 ] && [ "$resources_needed" -eq 0 ]; then
+      log_update "launcher and resources are up to date"
       exit 0
     fi
 
-    if ! /bin/bash -n "$work/launch.command" >/dev/null 2>&1; then
-      log_update "downloaded launcher failed the syntax check"
+    if [ "$launcher_needed" -eq 1 ]; then
+      curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 45 --retry 2 \
+        "$UPDATE_BASE_URL/launch.command" -o "$work/launch.command" || {
+        log_update "launcher download failed"
+      }
+      if [ -f "$work/launch.command" ]; then
+        actual="$(shasum -a 256 "$work/launch.command" | awk '{print $1}')"
+        if [ "$actual" != "$sha" ]; then
+          log_update "launcher hash does not match the manifest"
+        elif ! /bin/bash -n "$work/launch.command" >/dev/null 2>&1; then
+          log_update "downloaded launcher failed the syntax check"
+        else
+          staged="$resources_dir/.launch.command.new.$$"
+          if cp "$work/launch.command" "$staged" && chmod 755 "$staged" &&
+            mv "$staged" "$resources_dir/launch.command"; then
+            mkdir -p "$(dirname "$UPDATE_VERSION_FILE")" 2>/dev/null || true
+            printf '%s\n' "$version" > "$UPDATE_VERSION_FILE.tmp.$$"
+            chmod 600 "$UPDATE_VERSION_FILE.tmp.$$"
+            mv "$UPDATE_VERSION_FILE.tmp.$$" "$UPDATE_VERSION_FILE" 2>/dev/null || true
+            log_update "launcher updated to version $version"
+          else
+            rm -f "$staged" 2>/dev/null || true
+            log_update "could not replace the launcher"
+          fi
+        fi
+      fi
+    fi
+
+    [ "$resources_needed" -eq 1 ] || exit 0
+
+    config_json="$(curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 30 \
+      "http://$onion/api/config" 2>/dev/null || true)"
+    current_server="$(printf '%s' "$config_json" |
+      sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+    if [ -z "$current_server" ]; then
+      log_update "could not read the server version; resources not staged"
+      exit 0
+    fi
+    if [ "$current_server" != "$server_version" ]; then
+      log_update "server is $current_server but the bundle is for $server_version; resources not staged"
       exit 0
     fi
 
-    staged="$resources_dir/.launch.command.new.$$"
-    cp "$work/launch.command" "$staged" || exit 0
-    chmod 755 "$staged"
-    if ! mv "$staged" "$resources_dir/launch.command"; then
-      rm -f "$staged"
-      log_update "could not replace the launcher"
+    log_update "downloading frontend and proxy for $server_version"
+    curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 600 --retry 2 \
+      "$UPDATE_BASE_URL/webui.tar.gz" -o "$work/webui.tar.gz" || {
+      log_update "frontend download failed"
+      exit 0
+    }
+    curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 300 --retry 2 \
+      "$UPDATE_BASE_URL/silk-chat-proxy" -o "$work/silk-chat-proxy" || {
+      log_update "proxy download failed"
+      exit 0
+    }
+    curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 45 --retry 2 \
+      "$UPDATE_BASE_URL/webui-version.txt" -o "$work/webui-version.txt" || {
+      log_update "frontend version download failed"
+      exit 0
+    }
+
+    if [ "$(shasum -a 256 "$work/webui.tar.gz" | awk '{print $1}')" != "$webui_sha" ]; then
+      log_update "frontend hash does not match the manifest"
+      exit 0
+    fi
+    if [ "$(shasum -a 256 "$work/silk-chat-proxy" | awk '{print $1}')" != "$proxy_sha" ]; then
+      log_update "proxy hash does not match the manifest"
+      exit 0
+    fi
+    if [ "$(shasum -a 256 "$work/webui-version.txt" | awk '{print $1}')" != "$resources_version" ]; then
+      log_update "frontend version hash does not match the manifest"
+      exit 0
+    fi
+    if [ "$(sed -n 's/^open-webui //p' "$work/webui-version.txt" | head -1)" != "$server_version" ]; then
+      log_update "frontend version does not match the manifest server version"
+      exit 0
+    fi
+    if ! /usr/bin/file "$work/silk-chat-proxy" | grep -q 'Mach-O'; then
+      log_update "downloaded proxy is not a Mach-O binary"
       exit 0
     fi
 
-    mkdir -p "$(dirname "$UPDATE_VERSION_FILE")" 2>/dev/null || true
-    printf '%s\n' "$version" > "$UPDATE_VERSION_FILE.tmp.$$"
-    chmod 600 "$UPDATE_VERSION_FILE.tmp.$$"
-    mv "$UPDATE_VERSION_FILE.tmp.$$" "$UPDATE_VERSION_FILE" 2>/dev/null || true
-    log_update "launcher updated to version $version"
+    mkdir -p "$work/webui"
+    tar -xzf "$work/webui.tar.gz" -C "$work/webui" || {
+      log_update "frontend archive could not be extracted"
+      exit 0
+    }
+    [ -f "$work/webui/index.html" ] || {
+      log_update "frontend archive has no index.html"
+      exit 0
+    }
+    chmod 755 "$work/silk-chat-proxy"
+
+    pending_tmp="$PENDING_RESOURCES.$$"
+    rm -rf "$pending_tmp"
+    if ! mkdir -p "$pending_tmp"; then
+      log_update "could not create the pending resource directory"
+      exit 0
+    fi
+    if ! mv "$work/webui" "$pending_tmp/webui" ||
+      ! mv "$work/silk-chat-proxy" "$pending_tmp/silk-chat-proxy" ||
+      ! cp "$work/webui-version.txt" "$pending_tmp/webui-version.txt"; then
+      rm -rf "$pending_tmp"
+      log_update "could not stage the frontend and proxy"
+      exit 0
+    fi
+    chmod 755 "$pending_tmp/silk-chat-proxy"
+    rm -rf "$PENDING_RESOURCES"
+    if ! mv "$pending_tmp" "$PENDING_RESOURCES"; then
+      log_update "could not publish the staged frontend and proxy"
+      exit 0
+    fi
+    log_update "frontend and proxy staged for the next launch"
   )
 }
 
@@ -388,6 +573,8 @@ trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+apply_pending_resources
 
 if start_local_proxy; then
   browser_url="$local_url"
