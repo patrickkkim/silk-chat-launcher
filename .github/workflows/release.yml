@@ -19,6 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Verify signed launcher
+        id: manifest
         env:
           LAUNCHER_PUBLIC_KEY: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILvj4ZhAL+Jve263cPzibOBvqrSHLf20FqJ5nev1l/dq"
         run: |
@@ -33,44 +34,159 @@ jobs:
             -I silk-chat-launcher \
             -n silk-chat-launcher \
             -s manifest.txt.sig < manifest.txt
+
           version="$(sed -n 's/^version=//p' manifest.txt | head -1)"
           sha="$(sed -n 's/^sha256=//p' manifest.txt | head -1)"
-          actual="$(sha256sum launch.command | awk '{print $1}')"
+          webui_sha="$(sed -n 's/^webui_sha256=//p' manifest.txt | head -1)"
+          proxy_sha="$(sed -n 's/^proxy_sha256=//p' manifest.txt | head -1)"
+          resources_version="$(sed -n 's/^resources_version=//p' manifest.txt | head -1)"
+          server_version="$(sed -n 's/^server_version=//p' manifest.txt | head -1)"
+          source_commit="$(sed -n 's/^source_commit=//p' manifest.txt | head -1)"
+
           case "$version" in
             ''|*[!0-9]*) echo "Invalid version" >&2; exit 1 ;;
           esac
+          case "$sha" in
+            ''|*[!0-9a-f]*) echo "Invalid launcher hash" >&2; exit 1 ;;
+          esac
+          if [ "${#sha}" -ne 64 ]; then
+            echo "Invalid launcher hash length" >&2
+            exit 1
+          fi
+
+          has_resources=false
+          if [ -n "$webui_sha" ] || [ -n "$proxy_sha" ] ||
+            [ -n "$resources_version" ] || [ -n "$server_version" ] ||
+            [ -n "$source_commit" ]; then
+            has_resources=true
+            for candidate in "$webui_sha" "$proxy_sha" "$resources_version"; do
+              case "$candidate" in
+                ''|*[!0-9a-f]*) echo "Invalid resource manifest hash" >&2; exit 1 ;;
+              esac
+              if [ "${#candidate}" -ne 64 ]; then
+                echo "Invalid resource manifest hash length" >&2
+                exit 1
+              fi
+            done
+            case "$server_version" in
+              ''|*[!0-9.]*|.*|*.) echo "Invalid server version" >&2; exit 1 ;;
+            esac
+            case "$source_commit" in
+              ''|*[!0-9a-f]*) echo "Invalid source commit" >&2; exit 1 ;;
+            esac
+            if [ "${#source_commit}" -ne 40 ]; then
+              echo "Invalid source commit length" >&2
+              exit 1
+            fi
+          fi
+
+          actual="$(sha256sum launch.command | awk '{print $1}')"
           if [ "$sha" != "$actual" ]; then
             echo "Manifest hash does not match launch.command" >&2
             exit 1
           fi
-      - name: Publish rolling release
+
+          {
+            echo "version=$version"
+            echo "webui_sha=$webui_sha"
+            echo "proxy_sha=$proxy_sha"
+            echo "resources_version=$resources_version"
+            echo "server_version=$server_version"
+            echo "source_commit=$source_commit"
+            echo "has_resources=$has_resources"
+          } >> "$GITHUB_OUTPUT"
+      - name: Fetch private artifacts
+        if: steps.manifest.outputs.has_resources == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          SILK_CHAT_READ_KEY: ${{ secrets.SILK_CHAT_READ_KEY }}
+          SOURCE_COMMIT: ${{ steps.manifest.outputs.source_commit }}
+          WEBUI_SHA: ${{ steps.manifest.outputs.webui_sha }}
+          PROXY_SHA: ${{ steps.manifest.outputs.proxy_sha }}
+          RESOURCES_VERSION: ${{ steps.manifest.outputs.resources_version }}
+          SERVER_VERSION: ${{ steps.manifest.outputs.server_version }}
         run: |
           set -euo pipefail
-          if [ ! -f launch.command ] || [ ! -f manifest.txt ] || [ ! -f manifest.txt.sig ]; then
-            echo "No launcher artifacts in this commit; nothing to publish."
-            exit 0
+          if [ -z "$SILK_CHAT_READ_KEY" ]; then
+            echo "Missing GitHub Actions secret: SILK_CHAT_READ_KEY" >&2
+            exit 1
           fi
-          version="$(sed -n 's/^version=//p' manifest.txt | head -1)"
+
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SILK_CHAT_READ_KEY" > ~/.ssh/silk_chat_read
+          chmod 600 ~/.ssh/silk_chat_read
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+
+          repo="$RUNNER_TEMP/silk-chat"
+          git init "$repo"
+          git -C "$repo" remote add origin git@github.com:patrickkkim/silk-chat.git
+          GIT_SSH_COMMAND="ssh -i $HOME/.ssh/silk_chat_read -o IdentitiesOnly=yes" \
+            git -C "$repo" fetch --depth 1 origin "$SOURCE_COMMIT"
+          git -C "$repo" checkout --detach FETCH_HEAD
+
+          macos="$repo/clients/desktop/macos"
+          if [ "$(sha256sum "$macos/webui.tar.gz" | awk '{print $1}')" != "$WEBUI_SHA" ]; then
+            echo "webui.tar.gz hash does not match the manifest" >&2
+            exit 1
+          fi
+          if [ "$(sha256sum "$macos/silk-chat-proxy" | awk '{print $1}')" != "$PROXY_SHA" ]; then
+            echo "silk-chat-proxy hash does not match the manifest" >&2
+            exit 1
+          fi
+          if [ "$(sha256sum "$macos/webui-version.txt" | awk '{print $1}')" != "$RESOURCES_VERSION" ]; then
+            echo "webui-version.txt hash does not match the manifest" >&2
+            exit 1
+          fi
+          if [ "$(sed -n 's/^open-webui //p' "$macos/webui-version.txt" | head -1)" != "$SERVER_VERSION" ]; then
+            echo "webui-version.txt server version does not match the manifest" >&2
+            exit 1
+          fi
+
+          staging="$RUNNER_TEMP/launcher-release"
+          mkdir -p "$staging"
+          cp launch.command "$staging/launch.command"
+          cp manifest.txt "$staging/manifest.txt"
+          cp manifest.txt.sig "$staging/manifest.txt.sig"
+          cp "$macos/webui.tar.gz" "$staging/webui.tar.gz"
+          cp "$macos/silk-chat-proxy" "$staging/silk-chat-proxy"
+          cp "$macos/webui-version.txt" "$staging/webui-version.txt"
+      - name: Publish rolling release
+        if: steps.manifest.outputs.version != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.manifest.outputs.version }}
+        run: |
+          set -euo pipefail
+          staging="$RUNNER_TEMP/launcher-release"
+          mkdir -p "$staging"
+          [ -f "$staging/launch.command" ] || cp launch.command "$staging/launch.command"
+          [ -f "$staging/manifest.txt" ] || cp manifest.txt "$staging/manifest.txt"
+          [ -f "$staging/manifest.txt.sig" ] || cp manifest.txt.sig "$staging/manifest.txt.sig"
           base="https://github.com/${{ github.repository }}/releases/download/launcher-latest"
           latest="$(curl -fsSL "$base/manifest.txt" 2>/dev/null | sed -n 's/^version=//p' | head -1 || true)"
           case "$latest" in
             ''|*[!0-9]*) latest=0 ;;
           esac
-          if [ "$latest" -ge "$version" ]; then
-            echo "launcher-latest is already at version $latest; skipping $version."
+          if [ "$latest" -gt "$VERSION" ]; then
+            echo "launcher-latest is already at version $latest; skipping $VERSION."
             exit 0
           fi
           if ! gh release view launcher-latest >/dev/null 2>&1; then
             gh release create launcher-latest \
               --title "Silk Chat launcher (rolling)" \
-              --notes "Signed macOS launcher updates. Managed by CI." \
+              --notes "Signed macOS launcher and resource updates. Managed by CI." \
               --target "$GITHUB_SHA" \
               --prerelease
           fi
-          gh release upload launcher-latest \
-            launch.command \
-            manifest.txt \
-            manifest.txt.sig \
-            --clobber
+          files=(
+            "$RUNNER_TEMP/launcher-release/launch.command"
+            "$RUNNER_TEMP/launcher-release/manifest.txt"
+            "$RUNNER_TEMP/launcher-release/manifest.txt.sig"
+          )
+          if [ -f "$RUNNER_TEMP/launcher-release/webui.tar.gz" ]; then
+            files+=(
+              "$RUNNER_TEMP/launcher-release/webui.tar.gz"
+              "$RUNNER_TEMP/launcher-release/silk-chat-proxy"
+              "$RUNNER_TEMP/launcher-release/webui-version.txt"
+            )
+          fi
+          gh release upload launcher-latest "${files[@]}" --clobber
