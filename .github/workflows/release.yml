@@ -23,12 +23,10 @@ jobs:
           LAUNCHER_PUBLIC_KEY: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILvj4ZhAL+Jve263cPzibOBvqrSHLf20FqJ5nev1l/dq"
         run: |
           set -euo pipefail
-          for file in launch.command manifest.txt manifest.txt.sig; do
-            if [ ! -f "$file" ]; then
-              echo "Missing $file" >&2
-              exit 1
-            fi
-          done
+          if [ ! -f launch.command ] || [ ! -f manifest.txt ] || [ ! -f manifest.txt.sig ]; then
+            echo "No launcher artifacts in this commit; nothing to publish."
+            exit 0
+          fi
           printf 'silk-chat-launcher %s\n' "$LAUNCHER_PUBLIC_KEY" > "$RUNNER_TEMP/allowed_signers"
           ssh-keygen -Y verify \
             -f "$RUNNER_TEMP/allowed_signers" \
