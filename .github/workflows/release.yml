@@ -1,0 +1,74 @@
+---
+name: Publish launcher release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: launcher-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify signed launcher
+        env:
+          LAUNCHER_PUBLIC_KEY: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILvj4ZhAL+Jve263cPzibOBvqrSHLf20FqJ5nev1l/dq"
+        run: |
+          set -euo pipefail
+          for file in launch.command manifest.txt manifest.txt.sig; do
+            if [ ! -f "$file" ]; then
+              echo "Missing $file" >&2
+              exit 1
+            fi
+          done
+          printf 'silk-chat-launcher %s\n' "$LAUNCHER_PUBLIC_KEY" > "$RUNNER_TEMP/allowed_signers"
+          ssh-keygen -Y verify \
+            -f "$RUNNER_TEMP/allowed_signers" \
+            -I silk-chat-launcher \
+            -n silk-chat-launcher \
+            -s manifest.txt.sig < manifest.txt
+          version="$(sed -n 's/^version=//p' manifest.txt | head -1)"
+          sha="$(sed -n 's/^sha256=//p' manifest.txt | head -1)"
+          actual="$(sha256sum launch.command | awk '{print $1}')"
+          case "$version" in
+            ''|*[!0-9]*) echo "Invalid version" >&2; exit 1 ;;
+          esac
+          if [ "$sha" != "$actual" ]; then
+            echo "Manifest hash does not match launch.command" >&2
+            exit 1
+          fi
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version=//p' manifest.txt | head -1)"
+          base="https://github.com/${{ github.repository }}/releases/download/launcher-latest"
+          latest="$(curl -fsSL "$base/manifest.txt" 2>/dev/null | sed -n 's/^version=//p' | head -1 || true)"
+          case "$latest" in
+            ''|*[!0-9]*) latest=0 ;;
+          esac
+          if [ "$latest" -ge "$version" ]; then
+            echo "launcher-latest is already at version $latest; skipping $version."
+            exit 0
+          fi
+          if ! gh release view launcher-latest >/dev/null 2>&1; then
+            gh release create launcher-latest \
+              --title "Silk Chat launcher (rolling)" \
+              --notes "Signed macOS launcher updates. Managed by CI." \
+              --target "$GITHUB_SHA" \
+              --prerelease
+          fi
+          gh release upload launcher-latest \
+            launch.command \
+            manifest.txt \
+            manifest.txt.sig \
+            --clobber
