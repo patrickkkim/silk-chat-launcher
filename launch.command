@@ -31,6 +31,7 @@ UPDATE_LOG="${SILK_CHAT_UPDATE_LOG:-$HOME/Library/Logs/Silk Chat/updater.log}"
 SESSION_FILE="${SILK_CHAT_SESSION_FILE:-$HOME/.config/silk-chat/session}"
 PENDING_RESOURCES="${SILK_CHAT_PENDING_RESOURCES:-$HOME/.config/silk-chat/pending-resources}"
 ROLLBACK_RESOURCES="${SILK_CHAT_ROLLBACK_RESOURCES:-$HOME/.config/silk-chat/rollback-resources}"
+STATUS_FILE="${SILK_CHAT_STATUS_FILE:-$HOME/.config/silk-chat/status}"
 TOR_UPDATE_CHECK_FILE="${SILK_CHAT_TOR_UPDATE_CHECK_FILE:-$HOME/.config/silk-chat/last-tor-browser-check}"
 TOR_PENDING="${SILK_CHAT_TOR_PENDING:-$HOME/.config/silk-chat/pending-tor-browser}"
 TOR_ROLLBACK="${SILK_CHAT_TOR_ROLLBACK:-$HOME/.config/silk-chat/rollback-tor-browser}"
@@ -230,6 +231,47 @@ start_local_proxy() {
 log_update() {
   mkdir -p "$(dirname "$UPDATE_LOG")" 2>/dev/null || return 0
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$UPDATE_LOG" 2>/dev/null || true
+}
+
+status_write() {
+  local phase="$1" message="$2" visible="$3" tmp
+  mkdir -p "$(dirname "$STATUS_FILE")" 2>/dev/null || return 0
+  tmp="$STATUS_FILE.$$"
+  {
+    printf 'phase=%s\n' "$phase"
+    printf 'message=%s\n' "$message"
+    printf 'visible=%s\n' "$visible"
+    printf 'updated=%s\n' "$(date +%s)"
+  } > "$tmp" 2>/dev/null || {
+    rm -f "$tmp" 2>/dev/null || true
+    return 0
+  }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$STATUS_FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+}
+
+status_set() {
+  status_write "$1" "$2" 1
+}
+
+status_hide() {
+  status_write "idle" "" 0
+}
+
+status_is_update_phase() {
+  local phase
+  [ -f "$STATUS_FILE" ] || return 1
+  phase="$(sed -n 's/^phase=//p' "$STATUS_FILE" 2>/dev/null | head -1)"
+  case "$phase" in
+    downloading|installing|downloaded) return 0 ;;
+  esac
+  return 1
+}
+
+status_notice() {
+  status_set downloaded "$1"
+  sleep 3
+  status_hide
 }
 
 valid_sha() {
@@ -440,15 +482,18 @@ stage_tor_browser_update() {
   fi
 
   log_update "downloading Tor Browser $version"
+  status_set downloading "Downloading Tor Browser $version…"
   dmg="$work/tor-browser.dmg"
   if ! curl -fsSL --no-progress-meter --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 1800 --retry 2 \
     "$binary" -o "$dmg"; then
     log_update "Tor Browser download failed"
+    status_hide
     rm -rf "$work"
     return 0
   fi
   if [ "$(stat -f%z "$dmg" 2>/dev/null || echo 0)" -lt 20000000 ]; then
     log_update "Tor Browser download is unexpectedly small"
+    status_hide
     rm -rf "$work"
     return 0
   fi
@@ -456,22 +501,26 @@ stage_tor_browser_update() {
   rm -rf "$pending_tmp"
   if ! mkdir -p "$pending_tmp"; then
     log_update "could not create the pending Tor Browser directory"
+    status_hide
     rm -rf "$work"
     return 0
   fi
   if ! mv "$dmg" "$pending_tmp/tor-browser.dmg" ||
     ! printf '%s\n' "$version" > "$pending_tmp/version"; then
     log_update "could not stage the Tor Browser update"
+    status_hide
     rm -rf "$pending_tmp" "$work"
     return 0
   fi
   rm -rf "$TOR_PENDING"
   if ! mv "$pending_tmp" "$TOR_PENDING"; then
     log_update "could not publish the staged Tor Browser update"
+    status_hide
     rm -rf "$work"
     return 0
   fi
   log_update "Tor Browser $version staged for the next launch"
+  status_notice "Tor Browser $version is ready — it will install next time."
   rm -rf "$work"
 }
 
@@ -500,6 +549,7 @@ apply_pending_tor_browser_update() {
     return 0
   fi
 
+  status_set installing "Installing Tor Browser $version…"
   log_update "applying staged Tor Browser $version"
   work="$(mktemp -d "${TMPDIR:-/tmp}/silk-chat-tor-apply.XXXXXX")" || return 0
   mount_dir="$work/mnt"
@@ -566,7 +616,8 @@ update_launcher() {
 
   (
     work="$(mktemp -d "${TMPDIR:-/tmp}/silk-chat-update.XXXXXX")" || exit 0
-    trap 'rm -rf "$work"' EXIT
+    status_shown=0
+    trap 'rm -rf "$work"; if [ "$status_shown" = 1 ]; then status_hide; fi' EXIT
 
     wait_for_socks || {
       log_update "Tor SOCKS did not become ready"
@@ -651,6 +702,10 @@ update_launcher() {
       exit 0
     fi
 
+    status_shown=1
+    status_set downloading "Downloading the Silk Chat update…"
+    launcher_updated=0
+
     if [ "$launcher_needed" -eq 1 ]; then
       curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 45 --retry 2 \
         "$UPDATE_BASE_URL/launch.command" -o "$work/launch.command" || {
@@ -670,6 +725,7 @@ update_launcher() {
             printf '%s\n' "$version" > "$UPDATE_VERSION_FILE.tmp.$$"
             chmod 600 "$UPDATE_VERSION_FILE.tmp.$$"
             mv "$UPDATE_VERSION_FILE.tmp.$$" "$UPDATE_VERSION_FILE" 2>/dev/null || true
+            launcher_updated=1
             log_update "launcher updated to version $version"
           else
             rm -f "$staged" 2>/dev/null || true
@@ -679,7 +735,13 @@ update_launcher() {
       fi
     fi
 
-    [ "$resources_needed" -eq 1 ] || exit 0
+    if [ "$resources_needed" -eq 0 ]; then
+      if [ "$launcher_updated" -eq 1 ]; then
+        status_set downloaded "Silk Chat update ready — reopen to finish."
+        sleep 3
+      fi
+      exit 0
+    fi
 
     config_json="$(curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 30 \
       "http://$onion/api/config" 2>/dev/null || true)"
@@ -695,6 +757,7 @@ update_launcher() {
     fi
 
     log_update "downloading frontend and proxy for $server_version"
+    status_set downloading "Downloading the Silk Chat frontend…"
     curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 600 --retry 2 \
       "$UPDATE_BASE_URL/webui.tar.gz" -o "$work/webui.tar.gz" || {
       log_update "frontend download failed"
@@ -763,8 +826,12 @@ update_launcher() {
       exit 0
     fi
     log_update "frontend and proxy staged for the next launch"
+    status_set downloaded "Silk Chat update ready — it will install next time."
+    sleep 3
   )
 }
+
+status_set starting "Starting Silk Chat…"
 
 onion=""
 if [ -s "$ONION_FILE" ]; then
@@ -795,14 +862,24 @@ if browser_running || tor_running; then
   }
 fi
 
+if [ -f "$TOR_PENDING/tor-browser.dmg" ] && [ -f "$TOR_PENDING/version" ]; then
+  tor_pending_version="$(head -1 "$TOR_PENDING/version" 2>/dev/null || true)"
+  status_set installing "Installing Tor Browser ${tor_pending_version:-update}…"
+fi
 apply_pending_tor_browser_update
+status_set starting "Starting Silk Chat…"
 
 trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+if [ -f "$PENDING_RESOURCES/webui/index.html" ] && [ -x "$PENDING_RESOURCES/silk-chat-proxy" ]; then
+  status_set installing "Installing the Silk Chat update…"
+fi
 apply_pending_resources
+
+status_set opening "Opening Silk Chat…"
 
 if start_local_proxy; then
   browser_url="$local_url"
@@ -825,6 +902,7 @@ if [ "${SILK_CHAT_DISABLE_UPDATE:-}" != "1" ]; then
   (
     sleep 60
     kill -0 "$browser_pid" 2>/dev/null || exit 0
+    trap 'status_is_update_phase && status_hide' EXIT
     update_launcher
     stage_tor_browser_update
   ) >> "$UPDATE_LOG" 2>&1 &
