@@ -186,6 +186,7 @@ set_session_homepage() {
 }
 
 cleanup() {
+  status_hide
   stop_local_proxy
   clear_session_file
 }
