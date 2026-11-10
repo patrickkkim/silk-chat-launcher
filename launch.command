@@ -22,6 +22,8 @@ WEBUI_DIR="${SILK_CHAT_WEBUI_DIR:-$SCRIPT_DIR/webui}"
 local_proxy_pid=""
 local_handshake=""
 local_url=""
+browser_pid=""
+open_pid=""
 
 LAUNCHER_SIGNING_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILvj4ZhAL+Jve263cPzibOBvqrSHLf20FqJ5nev1l/dq"
 UPDATE_BASE_URL="${SILK_CHAT_UPDATE_BASE_URL:-https://github.com/patrickkkim/silk-chat-launcher/releases/download/launcher-latest}"
@@ -32,11 +34,6 @@ SESSION_FILE="${SILK_CHAT_SESSION_FILE:-$HOME/.config/silk-chat/session}"
 PENDING_RESOURCES="${SILK_CHAT_PENDING_RESOURCES:-$HOME/.config/silk-chat/pending-resources}"
 ROLLBACK_RESOURCES="${SILK_CHAT_ROLLBACK_RESOURCES:-$HOME/.config/silk-chat/rollback-resources}"
 STATUS_FILE="${SILK_CHAT_STATUS_FILE:-$HOME/.config/silk-chat/status}"
-TOR_UPDATE_CHECK_FILE="${SILK_CHAT_TOR_UPDATE_CHECK_FILE:-$HOME/.config/silk-chat/last-tor-browser-check}"
-TOR_PENDING="${SILK_CHAT_TOR_PENDING:-$HOME/.config/silk-chat/pending-tor-browser}"
-TOR_ROLLBACK="${SILK_CHAT_TOR_ROLLBACK:-$HOME/.config/silk-chat/rollback-tor-browser}"
-TOR_UPDATE_API="${SILK_CHAT_TOR_UPDATE_API:-https://aus1.torproject.org/torbrowser/update_3/release/download-macos.json}"
-TOR_TEAM_ID="MADPSAYN6T"
 UPDATE_INTERVAL=86400
 
 say_error() {
@@ -79,12 +76,82 @@ find_tor_browser() {
   return 1
 }
 
+browser_pid_for_profile() {
+  local pid command binary
+  [ -n "${browser:-}" ] || return 1
+  binary="${browser_real:-$browser}"
+  while read -r pid command; do
+    case "$command" in
+      "$binary "*|"$browser "*) ;;
+      *) continue ;;
+    esac
+    case " $command " in
+      *" -profile $TOR_PROFILE "*) printf '%s\n' "$pid"; return 0 ;;
+    esac
+  done < <(/bin/ps -axo pid=,command=)
+  return 1
+}
+
+wait_for_browser_pid() {
+  local attempts="${1:-150}" attempt pid
+  for ((attempt = 0; attempt < attempts; attempt++)); do
+    if pid="$(browser_pid_for_profile)"; then
+      printf '%s\n' "$pid"
+      return 0
+    fi
+    if [ -n "${open_pid:-}" ] && ! kill -0 "$open_pid" 2>/dev/null; then
+      local status=0
+      wait "$open_pid" 2>/dev/null || status=$?
+      [ "$status" -eq 0 ] || return 1
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
 launch_browser() {
-  if [ "$(uname -m)" = "arm64" ] && [ -x /usr/bin/arch ] &&
-    /usr/bin/lipo -archs "$browser" 2>/dev/null | tr ' ' '\n' | grep -qx arm64; then
-    exec /usr/bin/arch -arm64 "$browser" "$@"
+  local args=(-no-remote -profile "$TOR_PROFILE")
+  if [ -n "$KIOSK_FLAG" ]; then
+    args+=("$KIOSK_FLAG")
   fi
-  exec "$browser" "$@"
+  # LaunchServices makes Tor Browser, not this unsigned wrapper, responsible
+  # for its own app-bundle writes under macOS App Management.
+  /usr/bin/open -W -n -a "$browser_app" --args "${args[@]}" "$@" &
+  open_pid=$!
+}
+
+monitor_browser() {
+  local pid missing=0
+  while :; do
+    if pid="$(browser_pid_for_profile)"; then
+      missing=0
+      if [ "$pid" != "$browser_pid" ]; then
+        browser_pid="$pid"
+        write_session_file "$browser_pid" "$browser_app" "$browser_url"
+      fi
+    else
+      missing=$((missing + 1))
+      if [ "$missing" -ge 10 ]; then
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+}
+
+stop_browser() {
+  local pid="${browser_pid:-}"
+  if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+    pid="$(browser_pid_for_profile 2>/dev/null || true)"
+  fi
+  [ -n "$pid" ] || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in {1..12}; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.2
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+  return 0
 }
 
 browser_running() {
@@ -187,6 +254,7 @@ set_session_homepage() {
 
 cleanup() {
   status_hide
+  stop_browser
   stop_local_proxy
   clear_session_file
 }
@@ -282,31 +350,6 @@ valid_sha() {
   [ "${#1}" -eq 64 ]
 }
 
-version_gt() {
-  local new_version="$1" old_version="$2" index new_part old_part
-  local IFS=.
-  local -a new_parts old_parts
-  read -r -a new_parts <<< "$new_version"
-  read -r -a old_parts <<< "$old_version"
-  for index in 0 1 2 3; do
-    new_part="${new_parts[$index]:-0}"
-    old_part="${old_parts[$index]:-0}"
-    case "$new_part" in
-      ''|*[!0-9]*) new_part=0 ;;
-    esac
-    case "$old_part" in
-      ''|*[!0-9]*) old_part=0 ;;
-    esac
-    if [ "$new_part" -gt "$old_part" ]; then
-      return 0
-    fi
-    if [ "$new_part" -lt "$old_part" ]; then
-      return 1
-    fi
-  done
-  return 1
-}
-
 apply_pending_resources() {
   local resources_dir pending rollback
   resources_dir="$(cd "$(dirname "$0")" && pwd)" || return 0
@@ -386,23 +429,6 @@ self_update_due() {
   return 0
 }
 
-tor_update_due() {
-  local now last=0
-  now="$(date +%s)"
-  if [ -f "$TOR_UPDATE_CHECK_FILE" ]; then
-    last="$(cat "$TOR_UPDATE_CHECK_FILE" 2>/dev/null || echo 0)"
-    case "$last" in
-      ''|*[!0-9]*) last=0 ;;
-    esac
-  fi
-  if [ $((now - last)) -lt "$UPDATE_INTERVAL" ]; then
-    return 1
-  fi
-  mkdir -p "$(dirname "$TOR_UPDATE_CHECK_FILE")" 2>/dev/null || true
-  printf '%s\n' "$now" > "$TOR_UPDATE_CHECK_FILE" 2>/dev/null || true
-  return 0
-}
-
 wait_for_socks() {
   for _ in {1..60}; do
     if /usr/bin/nc -z 127.0.0.1 9150 >/dev/null 2>&1; then
@@ -413,192 +439,6 @@ wait_for_socks() {
   return 1
 }
 
-verify_tor_app() {
-  local app="$1" team
-  [ -x "$app/Contents/MacOS/firefox" ] || return 1
-  /usr/bin/codesign --verify --deep --strict "$app" >/dev/null 2>&1 || return 1
-  team="$(/usr/bin/codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p' | head -1)"
-  [ "$team" = "$TOR_TEAM_ID" ] || return 1
-  /usr/sbin/spctl --assess --type execute "$app" >/dev/null 2>&1 || return 1
-  return 0
-}
-
-stage_tor_browser_update() {
-  [ -n "${browser_app:-}" ] || return 0
-  tor_update_due || return 0
-
-  local current_version work update_json version binary dmg pending_tmp
-  current_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
-    "$browser_app/Contents/Info.plist" 2>/dev/null || true)"
-  if [ -z "$current_version" ]; then
-    log_update "could not read the installed Tor Browser version"
-    return 0
-  fi
-
-  work="$(mktemp -d "${TMPDIR:-/tmp}/silk-chat-tor-update.XXXXXX")" || return 0
-  wait_for_socks || {
-    log_update "Tor SOCKS did not become ready for the Tor Browser check"
-    rm -rf "$work"
-    return 0
-  }
-
-  update_json="$work/update.json"
-  if ! curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 60 --retry 2 \
-    "$TOR_UPDATE_API" -o "$update_json"; then
-    log_update "Tor Browser update metadata download failed"
-    rm -rf "$work"
-    return 0
-  fi
-
-  version="$(plutil -extract version raw -o - "$update_json" 2>/dev/null || true)"
-  binary="$(plutil -extract binary raw -o - "$update_json" 2>/dev/null || true)"
-  case "$version" in
-    ''|*[!0-9.]*|.*|*.)
-      log_update "Tor Browser update version is invalid"
-      rm -rf "$work"
-      return 0
-      ;;
-  esac
-  case "$binary" in
-    https://dist.torproject.org/torbrowser/*/*.dmg) ;;
-    *)
-      log_update "Tor Browser update URL is not a Tor Project DMG"
-      rm -rf "$work"
-      return 0
-      ;;
-  esac
-
-  if ! version_gt "$version" "$current_version"; then
-    log_update "Tor Browser is up to date at $current_version"
-    rm -rf "$work"
-    return 0
-  fi
-
-  pending_tmp="$TOR_PENDING.$$"
-  if [ -f "$TOR_PENDING/version" ] && [ -f "$TOR_PENDING/tor-browser.dmg" ] &&
-    [ "$(head -1 "$TOR_PENDING/version" 2>/dev/null)" = "$version" ]; then
-    log_update "Tor Browser $version is already staged"
-    rm -rf "$work"
-    return 0
-  fi
-
-  log_update "downloading Tor Browser $version"
-  status_set downloading "Downloading Tor Browser $version…"
-  dmg="$work/tor-browser.dmg"
-  if ! curl -fsSL --no-progress-meter --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 1800 --retry 2 \
-    "$binary" -o "$dmg"; then
-    log_update "Tor Browser download failed"
-    status_hide
-    rm -rf "$work"
-    return 0
-  fi
-  if [ "$(stat -f%z "$dmg" 2>/dev/null || echo 0)" -lt 20000000 ]; then
-    log_update "Tor Browser download is unexpectedly small"
-    status_hide
-    rm -rf "$work"
-    return 0
-  fi
-
-  rm -rf "$pending_tmp"
-  if ! mkdir -p "$pending_tmp"; then
-    log_update "could not create the pending Tor Browser directory"
-    status_hide
-    rm -rf "$work"
-    return 0
-  fi
-  if ! mv "$dmg" "$pending_tmp/tor-browser.dmg" ||
-    ! printf '%s\n' "$version" > "$pending_tmp/version"; then
-    log_update "could not stage the Tor Browser update"
-    status_hide
-    rm -rf "$pending_tmp" "$work"
-    return 0
-  fi
-  rm -rf "$TOR_PENDING"
-  if ! mv "$pending_tmp" "$TOR_PENDING"; then
-    log_update "could not publish the staged Tor Browser update"
-    status_hide
-    rm -rf "$work"
-    return 0
-  fi
-  log_update "Tor Browser $version staged for the next launch"
-  status_notice "Tor Browser $version is ready — it will install next time."
-  rm -rf "$work"
-}
-
-apply_pending_tor_browser_update() {
-  [ -n "${browser_app:-}" ] || return 0
-  [ -f "$TOR_PENDING/tor-browser.dmg" ] || return 0
-  [ -f "$TOR_PENDING/version" ] || return 0
-
-  local version current_version dest rollback work mount_dir new_app
-  version="$(head -1 "$TOR_PENDING/version" 2>/dev/null || true)"
-  [ -n "$version" ] || {
-    rm -rf "$TOR_PENDING"
-    return 0
-  }
-  current_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
-    "$browser_app/Contents/Info.plist" 2>/dev/null || true)"
-  if [ -n "$current_version" ] && ! version_gt "$version" "$current_version"; then
-    log_update "staged Tor Browser $version is not newer than $current_version"
-    rm -rf "$TOR_PENDING"
-    return 0
-  fi
-
-  dest="$browser_app"
-  if [ ! -w "$(dirname "$dest")" ]; then
-    log_update "Tor Browser $version is staged but $(dirname "$dest") is not writable"
-    return 0
-  fi
-
-  status_set installing "Installing Tor Browser $version…"
-  log_update "applying staged Tor Browser $version"
-  work="$(mktemp -d "${TMPDIR:-/tmp}/silk-chat-tor-apply.XXXXXX")" || return 0
-  mount_dir="$work/mnt"
-  mkdir -p "$mount_dir"
-  if ! hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$mount_dir" \
-    "$TOR_PENDING/tor-browser.dmg" >/dev/null 2>&1; then
-    log_update "could not mount the staged Tor Browser image"
-    rm -rf "$work" "$TOR_PENDING"
-    return 0
-  fi
-  new_app="$mount_dir/Tor Browser.app"
-  if ! verify_tor_app "$new_app"; then
-    log_update "staged Tor Browser failed signature verification"
-    hdiutil detach "$mount_dir" >/dev/null 2>&1 || true
-    rm -rf "$work" "$TOR_PENDING"
-    return 0
-  fi
-
-  rollback="$TOR_ROLLBACK"
-  rm -rf "$rollback" 2>/dev/null || true
-  mkdir -p "$rollback" || {
-    log_update "could not create the Tor Browser rollback directory"
-    hdiutil detach "$mount_dir" >/dev/null 2>&1 || true
-    rm -rf "$work"
-    return 0
-  }
-  if ! mv "$dest" "$rollback/Tor Browser.app" 2>/dev/null; then
-    log_update "could not move the current Tor Browser to rollback"
-    hdiutil detach "$mount_dir" >/dev/null 2>&1 || true
-    rm -rf "$work"
-    return 0
-  fi
-  if ! ditto "$new_app" "$dest" || ! verify_tor_app "$dest"; then
-    rm -rf "$dest" 2>/dev/null || true
-    mv "$rollback/Tor Browser.app" "$dest" 2>/dev/null || true
-    log_update "Tor Browser replacement failed; previous app restored"
-    hdiutil detach "$mount_dir" >/dev/null 2>&1 || true
-    rm -rf "$work" "$TOR_PENDING"
-    return 0
-  fi
-
-  /usr/bin/xattr -dr com.apple.quarantine "$dest" 2>/dev/null || true
-  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
-    -f "$dest" >/dev/null 2>&1 || true
-  hdiutil detach "$mount_dir" >/dev/null 2>&1 || true
-  rm -rf "$work" "$TOR_PENDING"
-  log_update "Tor Browser updated to $version"
-}
 
 update_launcher() {
   local resources_dir
@@ -853,8 +693,9 @@ browser="$(find_tor_browser)" || {
   exit 1
 }
 browser_app="$(cd "$(dirname "$browser")/../.." && pwd)"
-TOR_PROCESS_PATTERN="$browser"
-TOR_TOR_PATTERN="$(dirname "$browser")/Tor/tor"
+browser_real="$(cd "$(dirname "$browser")" && pwd -P)/$(basename "$browser")"
+TOR_PROCESS_PATTERN="$browser_real"
+TOR_TOR_PATTERN="$(dirname "$browser_real")/Tor/tor"
 
 if browser_running || tor_running; then
   stop_tor_browser || {
@@ -863,11 +704,6 @@ if browser_running || tor_running; then
   }
 fi
 
-if [ -f "$TOR_PENDING/tor-browser.dmg" ] && [ -f "$TOR_PENDING/version" ]; then
-  tor_pending_version="$(head -1 "$TOR_PENDING/version" 2>/dev/null || true)"
-  status_set installing "Installing Tor Browser ${tor_pending_version:-update}…"
-fi
-apply_pending_tor_browser_update
 status_set starting "Starting Silk Chat…"
 
 trap cleanup EXIT
@@ -890,12 +726,11 @@ fi
 
 set_session_homepage "$browser_url"
 
-if [ -n "$KIOSK_FLAG" ]; then
-  launch_browser -profile "$TOR_PROFILE" "$KIOSK_FLAG" "$browser_url" &
-else
-  launch_browser -profile "$TOR_PROFILE" "$browser_url" &
+launch_browser "$browser_url"
+if ! browser_pid="$(wait_for_browser_pid)"; then
+  say_error "Tor Browser did not start."
+  exit 1
 fi
-browser_pid=$!
 write_session_file "$browser_pid" "$browser_app" "$browser_url"
 
 if [ "${SILK_CHAT_DISABLE_UPDATE:-}" != "1" ]; then
@@ -905,8 +740,7 @@ if [ "${SILK_CHAT_DISABLE_UPDATE:-}" != "1" ]; then
     kill -0 "$browser_pid" 2>/dev/null || exit 0
     trap 'status_is_update_phase && status_hide' EXIT
     update_launcher
-    stage_tor_browser_update
   ) >> "$UPDATE_LOG" 2>&1 &
 fi
 
-wait "$browser_pid"
+monitor_browser
