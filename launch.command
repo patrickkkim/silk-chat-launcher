@@ -30,6 +30,7 @@ UPDATE_BASE_URL="${SILK_CHAT_UPDATE_BASE_URL:-https://github.com/patrickkkim/sil
 UPDATE_CHECK_FILE="${SILK_CHAT_UPDATE_CHECK_FILE:-$HOME/.config/silk-chat/last-launcher-check}"
 UPDATE_VERSION_FILE="${SILK_CHAT_UPDATE_VERSION_FILE:-$HOME/.config/silk-chat/launcher-version}"
 UPDATE_LOG="${SILK_CHAT_UPDATE_LOG:-$HOME/Library/Logs/Silk Chat/updater.log}"
+PROXY_LOG="${SILK_CHAT_PROXY_LOG:-$HOME/Library/Logs/Silk Chat/proxy.log}"
 SESSION_FILE="${SILK_CHAT_SESSION_FILE:-$HOME/.config/silk-chat/session}"
 PENDING_RESOURCES="${SILK_CHAT_PENDING_RESOURCES:-$HOME/.config/silk-chat/pending-resources}"
 ROLLBACK_RESOURCES="${SILK_CHAT_ROLLBACK_RESOURCES:-$HOME/.config/silk-chat/rollback-resources}"
@@ -267,7 +268,8 @@ start_local_proxy() {
   [ -x "$PROXY_BIN" ] && [ -f "$WEBUI_DIR/index.html" ] || return 1
 
   rm -f "$local_handshake"
-  "$PROXY_BIN" \
+  log_proxy "launch: starting local proxy"
+  SILK_CHAT_PROXY_LOG="$PROXY_LOG" "$PROXY_BIN" \
     --static-dir "$WEBUI_DIR" \
     --onion-file "$ONION_FILE" \
     --handshake "$local_handshake" \
@@ -300,6 +302,15 @@ start_local_proxy() {
 log_update() {
   mkdir -p "$(dirname "$UPDATE_LOG")" 2>/dev/null || return 0
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$UPDATE_LOG" 2>/dev/null || true
+}
+
+log_proxy() {
+  mkdir -p "$(dirname "$PROXY_LOG")" 2>/dev/null || return 0
+  if [ -f "$PROXY_LOG" ] && [ "$(wc -c <"$PROXY_LOG" 2>/dev/null | tr -d ' ')" -gt 1048576 ]; then
+    mv -f "$PROXY_LOG" "$PROXY_LOG.1" 2>/dev/null || true
+  fi
+  (umask 077 && printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$PROXY_LOG") 2>/dev/null || true
+  chmod 600 "$PROXY_LOG" 2>/dev/null || true
 }
 
 status_write() {
@@ -719,18 +730,22 @@ apply_pending_resources
 status_set opening "Opening Silk Chat…"
 
 if start_local_proxy; then
+  log_proxy "launch: local proxy ready"
   browser_url="$local_url"
 else
+  log_proxy "launch: local proxy unavailable; using the onion UI"
   browser_url="http://$onion"
 fi
 
 set_session_homepage "$browser_url"
 
+log_proxy "launch: starting Tor Browser"
 launch_browser "$browser_url"
 if ! browser_pid="$(wait_for_browser_pid)"; then
   say_error "Tor Browser did not start."
   exit 1
 fi
+log_proxy "launch: Tor Browser process ready"
 write_session_file "$browser_pid" "$browser_app" "$browser_url"
 
 if [ "${SILK_CHAT_DISABLE_UPDATE:-}" != "1" ]; then
