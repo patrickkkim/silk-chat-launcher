@@ -253,6 +253,21 @@ set_session_homepage() {
   mv "$tmp" "$user_js" 2>/dev/null || rm -f "$tmp"
 }
 
+configure_runtime_profile() {
+  local user_js="$TOR_PROFILE/user.js"
+  local tmp="$TOR_PROFILE/user.js.tmp.$$"
+
+  [ -f "$user_js" ] || return 0
+  grep -v -E 'network\.http\.max-persistent-connections-per-server|network\.http\.max-connections-per-server' \
+    "$user_js" > "$tmp" 2>/dev/null || true
+  cat >> "$tmp" <<'EOF'
+user_pref("network.http.max-persistent-connections-per-server", 24);
+user_pref("network.http.max-connections-per-server", 24);
+EOF
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$user_js" 2>/dev/null || rm -f "$tmp"
+}
+
 cleanup() {
   status_hide
   stop_browser
@@ -698,6 +713,7 @@ if [ ! -d "$TOR_PROFILE" ] || [ ! -f "$TOR_PROFILE/user.js" ]; then
   say_error "Silk Chat is not set up. Run the Silk Chat installer once, then open the app again."
   exit 1
 fi
+configure_runtime_profile
 
 browser="$(find_tor_browser)" || {
   say_error "Tor Browser is not installed. Run the Silk Chat installer again."
