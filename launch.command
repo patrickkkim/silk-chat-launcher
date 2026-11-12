@@ -2,11 +2,15 @@
 set -euo pipefail
 
 GUI=false
+UPDATE_ONLY=false
+PLAN_UPDATE=false
 case "${1:-}" in
   --gui) GUI=true ;;
+  --update-only) UPDATE_ONLY=true ;;
+  --plan-update) PLAN_UPDATE=true ;;
   "") ;;
   *)
-    printf 'Usage: %s [--gui]\n' "$0" >&2
+    printf 'Usage: %s [--gui|--update-only|--plan-update]\n' "$0" >&2
     exit 2
     ;;
 esac
@@ -376,6 +380,41 @@ valid_sha() {
   [ "${#1}" -eq 64 ]
 }
 
+# Both shipped artifacts decide whether a download is needed. The frontend
+# version file alone missed proxy-only releases: the launcher updated, said
+# "up to date", and left the old proxy running.
+resources_are_current() {
+  local resources_version="$1" proxy_sha="$2" resources_dir="$3"
+  local current_webui="" current_proxy=""
+  if [ -f "$resources_dir/webui-version.txt" ]; then
+    current_webui="$(shasum -a 256 "$resources_dir/webui-version.txt" | awk '{print $1}')"
+  fi
+  if [ -f "$resources_dir/silk-chat-proxy" ]; then
+    current_proxy="$(shasum -a 256 "$resources_dir/silk-chat-proxy" | awk '{print $1}')"
+  fi
+  [ -n "$resources_version" ] && [ -n "$proxy_sha" ] &&
+    [ "$current_webui" = "$resources_version" ] && [ "$current_proxy" = "$proxy_sha" ]
+}
+
+# Support and test entry point: decide from a local manifest without fetching,
+# verifying or applying anything.
+plan_update() {
+  local manifest="${SILK_CHAT_UPDATE_PLAN_MANIFEST:-}"
+  local resources_dir resources_version proxy_sha
+  if [ ! -f "$manifest" ]; then
+    printf 'plan: set SILK_CHAT_UPDATE_PLAN_MANIFEST to a manifest file\n' >&2
+    return 2
+  fi
+  resources_dir="$(cd "$(dirname "$0")" && pwd)" || return 2
+  resources_version="$(sed -n 's/^resources_version=//p' "$manifest" | head -1)"
+  proxy_sha="$(sed -n 's/^proxy_sha256=//p' "$manifest" | head -1)"
+  if resources_are_current "$resources_version" "$proxy_sha" "$resources_dir"; then
+    printf 'resources_needed=0\n'
+  else
+    printf 'resources_needed=1\n'
+  fi
+}
+
 apply_pending_resources() {
   local resources_dir pending rollback
   resources_dir="$(cd "$(dirname "$0")" && pwd)" || return 0
@@ -441,14 +480,16 @@ apply_pending_resources() {
 self_update_due() {
   local now last=0
   now="$(date +%s)"
-  if [ -f "$UPDATE_CHECK_FILE" ]; then
-    last="$(cat "$UPDATE_CHECK_FILE" 2>/dev/null || echo 0)"
-    case "$last" in
-      ''|*[!0-9]*) last=0 ;;
-    esac
-  fi
-  if [ $((now - last)) -lt "$UPDATE_INTERVAL" ]; then
-    return 1
+  if [ "${SILK_CHAT_FORCE_UPDATE:-}" != "1" ]; then
+    if [ -f "$UPDATE_CHECK_FILE" ]; then
+      last="$(cat "$UPDATE_CHECK_FILE" 2>/dev/null || echo 0)"
+      case "$last" in
+        ''|*[!0-9]*) last=0 ;;
+      esac
+    fi
+    if [ $((now - last)) -lt "$UPDATE_INTERVAL" ]; then
+      return 1
+    fi
   fi
   mkdir -p "$(dirname "$UPDATE_CHECK_FILE")" 2>/dev/null || true
   printf '%s\n' "$now" > "$UPDATE_CHECK_FILE" 2>/dev/null || true
@@ -555,11 +596,7 @@ update_launcher() {
     resources_needed=0
     if [ -n "$resources_version" ] && [ -n "$server_version" ] &&
       [ -n "$webui_sha" ] && [ -n "$proxy_sha" ]; then
-      current_resources=""
-      if [ -f "$resources_dir/webui-version.txt" ]; then
-        current_resources="$(shasum -a 256 "$resources_dir/webui-version.txt" | awk '{print $1}')"
-      fi
-      if [ "$current_resources" != "$resources_version" ]; then
+      if ! resources_are_current "$resources_version" "$proxy_sha" "$resources_dir"; then
         resources_needed=1
       fi
     fi
@@ -600,6 +637,15 @@ update_launcher() {
           fi
         fi
       fi
+    fi
+
+    if [ "$launcher_updated" -eq 1 ] && [ "${SILK_CHAT_UPDATE_REEXEC:-}" != "1" ]; then
+      # This run still has the old gate. Re-enter through the file just
+      # installed so the proxy check runs before "up to date" is reported.
+      rm -rf "$work" 2>/dev/null || true
+      export SILK_CHAT_UPDATE_REEXEC=1
+      export SILK_CHAT_FORCE_UPDATE=1
+      exec /bin/bash "$resources_dir/launch.command" --update-only
     fi
 
     if [ "$resources_needed" -eq 0 ]; then
@@ -697,6 +743,19 @@ update_launcher() {
     sleep 3
   )
 }
+
+if [ "$PLAN_UPDATE" = true ]; then
+  plan_update
+  exit $?
+fi
+
+if [ "$UPDATE_ONLY" = true ]; then
+  mkdir -p "$(dirname "$UPDATE_LOG")" 2>/dev/null || true
+  exec >> "$UPDATE_LOG" 2>&1
+  onion="$(normalize_onion "$(cat "$ONION_FILE" 2>/dev/null || true)")"
+  update_launcher
+  exit 0
+fi
 
 status_set starting "Starting Silk Chat…"
 
