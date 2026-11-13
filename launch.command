@@ -39,7 +39,7 @@ SESSION_FILE="${SILK_CHAT_SESSION_FILE:-$HOME/.config/silk-chat/session}"
 PENDING_RESOURCES="${SILK_CHAT_PENDING_RESOURCES:-$HOME/.config/silk-chat/pending-resources}"
 ROLLBACK_RESOURCES="${SILK_CHAT_ROLLBACK_RESOURCES:-$HOME/.config/silk-chat/rollback-resources}"
 STATUS_FILE="${SILK_CHAT_STATUS_FILE:-$HOME/.config/silk-chat/status}"
-UPDATE_INTERVAL=86400
+UPDATE_INTERVAL=0
 
 say_error() {
   local message="$1"
@@ -496,6 +496,12 @@ self_update_due() {
   return 0
 }
 
+set_update_base_url() {
+  if [ -n "$onion" ] && [ -z "${SILK_CHAT_UPDATE_BASE_URL:-}" ]; then
+    UPDATE_BASE_URL="http://$onion/static/updates/macos"
+  fi
+}
+
 wait_for_socks() {
   for _ in {1..60}; do
     if /usr/bin/nc -z 127.0.0.1 9150 >/dev/null 2>&1; then
@@ -753,6 +759,7 @@ if [ "$UPDATE_ONLY" = true ]; then
   mkdir -p "$(dirname "$UPDATE_LOG")" 2>/dev/null || true
   exec >> "$UPDATE_LOG" 2>&1
   onion="$(normalize_onion "$(cat "$ONION_FILE" 2>/dev/null || true)")"
+  set_update_base_url
   update_launcher
   exit 0
 fi
@@ -767,6 +774,7 @@ if ! valid_onion "$onion"; then
   say_error "Silk Chat is not set up. Run the Silk Chat installer once, then open the app again."
   exit 1
 fi
+set_update_base_url
 
 if [ ! -d "$TOR_PROFILE" ] || [ ! -f "$TOR_PROFILE/user.js" ]; then
   say_error "Silk Chat is not set up. Run the Silk Chat installer once, then open the app again."
@@ -826,10 +834,13 @@ write_session_file "$browser_pid" "$browser_app" "$browser_url"
 if [ "${SILK_CHAT_DISABLE_UPDATE:-}" != "1" ]; then
   mkdir -p "$(dirname "$UPDATE_LOG")" 2>/dev/null || true
   (
-    sleep 60
-    kill -0 "$browser_pid" 2>/dev/null || exit 0
     trap 'status_is_update_phase && status_hide' EXIT
-    update_launcher
+    while kill -0 "$browser_pid" 2>/dev/null; do
+      sleep 60
+      kill -0 "$browser_pid" 2>/dev/null || exit 0
+      update_launcher
+      sleep 900
+    done
   ) >> "$UPDATE_LOG" 2>&1 &
 fi
 
