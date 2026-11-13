@@ -698,10 +698,13 @@ update_launcher() {
     if [ "$launcher_updated" -eq 1 ] && [ "${SILK_CHAT_UPDATE_REEXEC:-}" != "1" ]; then
       # This run still has the old gate. Re-enter through the file just
       # installed so the proxy check runs before "up to date" is reported.
+      # Run it as a child instead of exec so this shell keeps its EXIT trap
+      # and clears the status written above when the check finishes.
       rm -rf "$work" 2>/dev/null || true
       export SILK_CHAT_UPDATE_REEXEC=1
       export SILK_CHAT_FORCE_UPDATE=1
-      exec /bin/bash "$resources_dir/launch.command" --update-only
+      /bin/bash "$resources_dir/launch.command" --update-only
+      exit $?
     fi
 
     if [ "$resources_needed" -eq 0 ]; then
