@@ -382,33 +382,76 @@ valid_sha() {
 
 # Both shipped artifacts decide whether a download is needed. The frontend
 # version file alone missed proxy-only releases: the launcher updated, said
-# "up to date", and left the old proxy running.
-resources_are_current() {
-  local resources_version="$1" proxy_sha="$2" resources_dir="$3"
-  local current_webui="" current_proxy=""
+# "up to date", and left the old proxy running. New installs also record the
+# bundle hash; older installs fall back to the version file and index.
+resource_needs() {
+  local resources_version="$1" webui_sha="$2" proxy_sha="$3" resources_dir="$4"
+  local current_version="" current_webui="" current_proxy=""
+  RESOURCE_WEBUI_NEEDED=0
+  RESOURCE_PROXY_NEEDED=0
+  RESOURCE_VERSION_NEEDED=0
+
   if [ -f "$resources_dir/webui-version.txt" ]; then
-    current_webui="$(shasum -a 256 "$resources_dir/webui-version.txt" | awk '{print $1}')"
+    current_version="$(shasum -a 256 "$resources_dir/webui-version.txt" | awk '{print $1}')"
+  fi
+  if [ -f "$resources_dir/webui/index.html" ] &&
+    [ -f "$resources_dir/webui/.silk-bundle-sha256" ]; then
+    current_webui="$(cat "$resources_dir/webui/.silk-bundle-sha256" 2>/dev/null || true)"
   fi
   if [ -f "$resources_dir/silk-chat-proxy" ]; then
     current_proxy="$(shasum -a 256 "$resources_dir/silk-chat-proxy" | awk '{print $1}')"
   fi
-  [ -n "$resources_version" ] && [ -n "$proxy_sha" ] &&
-    [ "$current_webui" = "$resources_version" ] && [ "$current_proxy" = "$proxy_sha" ]
+
+  [ -n "$resources_version" ] && [ -n "$webui_sha" ] && [ -n "$proxy_sha" ] || return 0
+
+  if [ -z "$current_webui" ] && [ "$current_version" = "$resources_version" ] &&
+    [ -f "$resources_dir/webui/index.html" ]; then
+    current_webui="$webui_sha"
+  fi
+
+  if [ "$current_version" != "$resources_version" ]; then
+    RESOURCE_VERSION_NEEDED=1
+  fi
+  if [ "$current_webui" != "$webui_sha" ]; then
+    RESOURCE_WEBUI_NEEDED=1
+  fi
+  if [ "$current_proxy" != "$proxy_sha" ]; then
+    RESOURCE_PROXY_NEEDED=1
+  fi
+}
+
+resources_are_current() {
+  [ -n "$1" ] && [ -n "$2" ] && [ -n "$3" ] || return 1
+  resource_needs "$@"
+  [ "$RESOURCE_WEBUI_NEEDED" -eq 0 ] &&
+    [ "$RESOURCE_PROXY_NEEDED" -eq 0 ] &&
+    [ "$RESOURCE_VERSION_NEEDED" -eq 0 ]
+}
+
+pending_is_current() {
+  local resources_version="$1" webui_sha="$2" proxy_sha="$3" pending="$4"
+  [ -n "$resources_version" ] && [ -n "$webui_sha" ] && [ -n "$proxy_sha" ] || return 1
+  [ -d "$pending" ] || return 1
+  resource_needs "$resources_version" "$webui_sha" "$proxy_sha" "$pending"
+  [ "$RESOURCE_WEBUI_NEEDED" -eq 0 ] &&
+    [ "$RESOURCE_PROXY_NEEDED" -eq 0 ] &&
+    [ "$RESOURCE_VERSION_NEEDED" -eq 0 ]
 }
 
 # Support and test entry point: decide from a local manifest without fetching,
 # verifying or applying anything.
 plan_update() {
   local manifest="${SILK_CHAT_UPDATE_PLAN_MANIFEST:-}"
-  local resources_dir resources_version proxy_sha
+  local resources_dir resources_version webui_sha proxy_sha
   if [ ! -f "$manifest" ]; then
     printf 'plan: set SILK_CHAT_UPDATE_PLAN_MANIFEST to a manifest file\n' >&2
     return 2
   fi
   resources_dir="$(cd "$(dirname "$0")" && pwd)" || return 2
   resources_version="$(sed -n 's/^resources_version=//p' "$manifest" | head -1)"
+  webui_sha="$(sed -n 's/^webui_sha256=//p' "$manifest" | head -1)"
   proxy_sha="$(sed -n 's/^proxy_sha256=//p' "$manifest" | head -1)"
-  if resources_are_current "$resources_version" "$proxy_sha" "$resources_dir"; then
+  if resources_are_current "$resources_version" "$webui_sha" "$proxy_sha" "$resources_dir"; then
     printf 'resources_needed=0\n'
   else
     printf 'resources_needed=1\n'
@@ -599,12 +642,19 @@ update_launcher() {
     launcher_needed=0
     [ "$version" -gt "$current" ] && launcher_needed=1
 
-    resources_needed=0
+    webui_needed=0
+    proxy_needed=0
+    version_needed=0
     if [ -n "$resources_version" ] && [ -n "$server_version" ] &&
       [ -n "$webui_sha" ] && [ -n "$proxy_sha" ]; then
-      if ! resources_are_current "$resources_version" "$proxy_sha" "$resources_dir"; then
-        resources_needed=1
-      fi
+      resource_needs "$resources_version" "$webui_sha" "$proxy_sha" "$resources_dir"
+      webui_needed="$RESOURCE_WEBUI_NEEDED"
+      proxy_needed="$RESOURCE_PROXY_NEEDED"
+      version_needed="$RESOURCE_VERSION_NEEDED"
+    fi
+    resources_needed=0
+    if [ "$webui_needed" -eq 1 ] || [ "$proxy_needed" -eq 1 ] || [ "$version_needed" -eq 1 ]; then
+      resources_needed=1
     fi
 
     if [ "$launcher_needed" -eq 0 ] && [ "$resources_needed" -eq 0 ]; then
@@ -662,6 +712,15 @@ update_launcher() {
       exit 0
     fi
 
+    if pending_is_current "$resources_version" "$webui_sha" "$proxy_sha" "$PENDING_RESOURCES"; then
+      log_update "resources already staged"
+      if [ "$launcher_updated" -eq 1 ]; then
+        status_set downloaded "Silk Chat update ready — reopen to finish."
+        sleep 3
+      fi
+      exit 0
+    fi
+
     config_json="$(curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 30 \
       "http://$onion/api/config" 2>/dev/null || true)"
     current_server="$(printf '%s' "$config_json" |
@@ -675,55 +734,79 @@ update_launcher() {
       exit 0
     fi
 
-    log_update "downloading frontend and proxy for $server_version"
-    status_set downloading "Downloading the Silk Chat frontend…"
-    curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 600 --retry 2 \
-      "$UPDATE_BASE_URL/webui.tar.gz" -o "$work/webui.tar.gz" || {
-      log_update "frontend download failed"
-      exit 0
-    }
-    curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 300 --retry 2 \
-      "$UPDATE_BASE_URL/silk-chat-proxy" -o "$work/silk-chat-proxy" || {
-      log_update "proxy download failed"
-      exit 0
-    }
-    curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 45 --retry 2 \
-      "$UPDATE_BASE_URL/webui-version.txt" -o "$work/webui-version.txt" || {
-      log_update "frontend version download failed"
-      exit 0
-    }
+    log_update "updating resources for $server_version (webui=$webui_needed proxy=$proxy_needed version=$version_needed)"
 
-    if [ "$(shasum -a 256 "$work/webui.tar.gz" | awk '{print $1}')" != "$webui_sha" ]; then
-      log_update "frontend hash does not match the manifest"
-      exit 0
+    if [ "$webui_needed" -eq 1 ]; then
+      status_set downloading "Downloading the Silk Chat frontend…"
+      curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 600 --retry 2 \
+        "$UPDATE_BASE_URL/webui.tar.gz" -o "$work/webui.tar.gz" || {
+        log_update "frontend download failed"
+        exit 0
+      }
+      if [ "$(shasum -a 256 "$work/webui.tar.gz" | awk '{print $1}')" != "$webui_sha" ]; then
+        log_update "frontend hash does not match the manifest"
+        exit 0
+      fi
+      mkdir -p "$work/webui"
+      tar -xzf "$work/webui.tar.gz" -C "$work/webui" || {
+        log_update "frontend archive could not be extracted"
+        exit 0
+      }
+    else
+      if ! cp -R "$resources_dir/webui" "$work/webui"; then
+        log_update "could not reuse the current frontend"
+        exit 0
+      fi
     fi
-    if [ "$(shasum -a 256 "$work/silk-chat-proxy" | awk '{print $1}')" != "$proxy_sha" ]; then
-      log_update "proxy hash does not match the manifest"
-      exit 0
-    fi
-    if [ "$(shasum -a 256 "$work/webui-version.txt" | awk '{print $1}')" != "$resources_version" ]; then
-      log_update "frontend version hash does not match the manifest"
-      exit 0
-    fi
-    if [ "$(sed -n 's/^open-webui //p' "$work/webui-version.txt" | head -1)" != "$server_version" ]; then
-      log_update "frontend version does not match the manifest server version"
-      exit 0
-    fi
-    if ! /usr/bin/file "$work/silk-chat-proxy" | grep -q 'Mach-O'; then
-      log_update "downloaded proxy is not a Mach-O binary"
-      exit 0
-    fi
-
-    mkdir -p "$work/webui"
-    tar -xzf "$work/webui.tar.gz" -C "$work/webui" || {
-      log_update "frontend archive could not be extracted"
-      exit 0
-    }
     [ -f "$work/webui/index.html" ] || {
-      log_update "frontend archive has no index.html"
+      log_update "frontend bundle has no index.html"
       exit 0
     }
+    printf '%s\n' "$webui_sha" > "$work/webui/.silk-bundle-sha256"
+
+    if [ "$proxy_needed" -eq 1 ]; then
+      status_set downloading "Downloading the Silk Chat proxy…"
+      curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 300 --retry 2 \
+        "$UPDATE_BASE_URL/silk-chat-proxy" -o "$work/silk-chat-proxy" || {
+        log_update "proxy download failed"
+        exit 0
+      }
+      if [ "$(shasum -a 256 "$work/silk-chat-proxy" | awk '{print $1}')" != "$proxy_sha" ]; then
+        log_update "proxy hash does not match the manifest"
+        exit 0
+      fi
+      if ! /usr/bin/file "$work/silk-chat-proxy" | grep -q 'Mach-O'; then
+        log_update "downloaded proxy is not a Mach-O binary"
+        exit 0
+      fi
+    else
+      if ! cp "$resources_dir/silk-chat-proxy" "$work/silk-chat-proxy"; then
+        log_update "could not reuse the current proxy"
+        exit 0
+      fi
+    fi
     chmod 755 "$work/silk-chat-proxy"
+
+    if [ "$version_needed" -eq 1 ]; then
+      curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 45 --retry 2 \
+        "$UPDATE_BASE_URL/webui-version.txt" -o "$work/webui-version.txt" || {
+        log_update "frontend version download failed"
+        exit 0
+      }
+      if [ "$(shasum -a 256 "$work/webui-version.txt" | awk '{print $1}')" != "$resources_version" ]; then
+        log_update "frontend version hash does not match the manifest"
+        exit 0
+      fi
+      if [ "$(sed -n 's/^open-webui //p' "$work/webui-version.txt" | head -1)" != "$server_version" ]; then
+        log_update "frontend version does not match the manifest server version"
+        exit 0
+      fi
+    else
+      if ! cp "$resources_dir/webui-version.txt" "$work/webui-version.txt"; then
+        log_update "could not reuse the current frontend version"
+        exit 0
+      fi
+    fi
 
     pending_tmp="$PENDING_RESOURCES.$$"
     rm -rf "$pending_tmp"
@@ -735,16 +818,16 @@ update_launcher() {
       ! mv "$work/silk-chat-proxy" "$pending_tmp/silk-chat-proxy" ||
       ! cp "$work/webui-version.txt" "$pending_tmp/webui-version.txt"; then
       rm -rf "$pending_tmp"
-      log_update "could not stage the frontend and proxy"
+      log_update "could not stage the resources"
       exit 0
     fi
     chmod 755 "$pending_tmp/silk-chat-proxy"
     rm -rf "$PENDING_RESOURCES"
     if ! mv "$pending_tmp" "$PENDING_RESOURCES"; then
-      log_update "could not publish the staged frontend and proxy"
+      log_update "could not publish the staged resources"
       exit 0
     fi
-    log_update "frontend and proxy staged for the next launch"
+    log_update "resources staged for the next launch"
     status_set downloaded "Silk Chat update ready — it will install next time."
     sleep 3
   )
