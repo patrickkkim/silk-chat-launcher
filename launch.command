@@ -4,13 +4,17 @@ set -euo pipefail
 GUI=false
 UPDATE_ONLY=false
 PLAN_UPDATE=false
+AGENT=false
+AGENT_ATTACH=false
 case "${1:-}" in
   --gui) GUI=true ;;
   --update-only) UPDATE_ONLY=true ;;
   --plan-update) PLAN_UPDATE=true ;;
+  --agent) AGENT=true ;;
+  --agent-attach) AGENT_ATTACH=true ;;
   "") ;;
   *)
-    printf 'Usage: %s [--gui|--update-only|--plan-update]\n' "$0" >&2
+    printf 'Usage: %s [--gui|--update-only|--plan-update|--agent|--agent-attach]\n' "$0" >&2
     exit 2
     ;;
 esac
@@ -23,6 +27,14 @@ TOR_APP_ALT="$HOME/Applications/Tor Browser.app"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROXY_BIN="${SILK_CHAT_PROXY_BIN:-$SCRIPT_DIR/silk-chat-proxy}"
 WEBUI_DIR="${SILK_CHAT_WEBUI_DIR:-$SCRIPT_DIR/webui}"
+TOR_BINARY="${SILK_CHAT_TOR_BINARY:-}"
+TOR_GEOIP_DIR="${SILK_CHAT_TOR_GEOIP_DIR:-}"
+TOR_DATA="${SILK_CHAT_TOR_DATA:-$HOME/.config/silk-chat/tor}"
+# The resident proxy: a LaunchAgent (install.command) runs this script with
+# --agent from login, so the proxy and its Tor are already connected when the
+# app is opened. It leaves its port and access token here for the launcher.
+AGENT_LABEL="${SILK_CHAT_AGENT_LABEL:-local.silk-chat.agent}"
+AGENT_HANDSHAKE="${SILK_CHAT_AGENT_HANDSHAKE:-$HOME/.config/silk-chat/agent-handshake}"
 local_proxy_pid=""
 local_handshake=""
 local_url=""
@@ -136,8 +148,12 @@ monitor_browser() {
       fi
     else
       missing=$((missing + 1))
-      if [ "$missing" -ge 10 ]; then
-        return 0
+      if [ "$missing" -eq 10 ]; then
+        # Keep the local proxy and its Tor process warm while the app is
+        # resident. Closing the window does not stop them; Cmd+Q stops a
+        # proxy this launcher started (the resident one runs until logout).
+        log_proxy "launch: browser closed; keeping the local proxy and Tor warm"
+        write_session_file 0 "$browser_app" "$browser_url"
       fi
     fi
     sleep 1
@@ -163,8 +179,25 @@ browser_running() {
   pgrep -f "^${TOR_PROCESS_PATTERN}" >/dev/null 2>&1
 }
 
+# Tor Browser's own tor processes. The proxy runs the same binary for its Tor
+# (started with -f <its data directory>/torrc); that one is not Tor Browser's
+# and must be left alone.
+browser_tor_pids() {
+  local pid command
+  while read -r pid command; do
+    case "$command" in
+      "$TOR_TOR_PATTERN "*|"$TOR_TOR_PATTERN") ;;
+      *) continue ;;
+    esac
+    case "$command " in
+      *" -f $TOR_DATA/torrc "*) continue ;;
+    esac
+    printf '%s\n' "$pid"
+  done < <(/bin/ps -axo pid=,command=)
+}
+
 tor_running() {
-  pgrep -f "^${TOR_TOR_PATTERN}" >/dev/null 2>&1
+  [ -n "$(browser_tor_pids)" ]
 }
 
 stop_tor_browser() {
@@ -184,7 +217,10 @@ stop_tor_browser() {
     sleep 1
   done
 
-  pkill -TERM -f "$TOR_TOR_PATTERN" >/dev/null 2>&1 || true
+  local pid
+  for pid in $(browser_tor_pids); do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
   for _ in {1..10}; do
     tor_running || return 0
     sleep 1
@@ -279,6 +315,188 @@ cleanup() {
   clear_session_file
 }
 
+# Give a new owned Tor what Tor Browser's has already learned, each only when
+# the owned Tor has none of its own:
+#   - the network directory, so it does not download it again;
+#   - the state file: Tor Browser's entry guards, so no further relays learn
+#     this address, and its measured circuit build times, so Tor replaces a
+#     stuck circuit in seconds from the first launch instead of after a minute.
+seed_owned_tor() {
+  local source="${SILK_CHAT_TOR_SEED_DIR:-$HOME/Library/Application Support/TorBrowser-Data/Tor}"
+  local copied=0 file
+
+  [ -d "$source" ] || return 0
+  mkdir -p "$TOR_DATA" 2>/dev/null || return 0
+  chmod 700 "$TOR_DATA" 2>/dev/null || true
+  if [ ! -f "$TOR_DATA/cached-microdesc-consensus" ]; then
+    for file in cached-certs cached-microdesc-consensus cached-microdescs cached-microdescs.new; do
+      if [ -f "$source/$file" ]; then
+        if cp -p "$source/$file" "$TOR_DATA/$file" 2>/dev/null; then
+          chmod 600 "$TOR_DATA/$file" 2>/dev/null || true
+          copied=1
+        fi
+      fi
+    done
+    if [ "$copied" = 1 ]; then
+      log_proxy "launch: seeded the owned Tor cache from Tor Browser"
+    fi
+  fi
+  if [ ! -f "$TOR_DATA/state" ] && [ -f "$source/state" ]; then
+    if cp -p "$source/state" "$TOR_DATA/state" 2>/dev/null; then
+      chmod 600 "$TOR_DATA/state" 2>/dev/null || true
+      log_proxy "launch: seeded the owned Tor guards and circuit timings from Tor Browser"
+    fi
+  fi
+}
+
+agent_loaded() {
+  /bin/launchctl print "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1
+}
+
+# Running proxies of this app bundle that use the device vault: "agent" lists
+# the resident one, "app" the ones a launcher started itself. The vault's
+# device token rotates on every exchange, and a token another proxy rotated
+# away signs the user out, so the two kinds must never run at the same time.
+# (A proxy with its own --auth-session-file does not share the vault.)
+silk_proxy_pids() {
+  local kind="$1" pid command
+  while read -r pid command; do
+    case "$command" in
+      "$PROXY_BIN "*) ;;
+      *) continue ;;
+    esac
+    case "$command " in
+      *" --static-dir "*) ;;
+      *) continue ;;
+    esac
+    case "$command " in
+      *" --auth-session-file "*) continue ;;
+    esac
+    case "$command " in
+      *" --handshake $AGENT_HANDSHAKE "*) [ "$kind" = agent ] || continue ;;
+      *) [ "$kind" = app ] || continue ;;
+    esac
+    printf '%s\n' "$pid"
+  done < <(/bin/ps -axo pid=,command=)
+}
+
+# Stops the resident proxy so a launcher can start its own instead. It stays
+# stopped until the next launch, login or install.
+stop_agent_proxy() {
+  /bin/launchctl kill SIGTERM "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 || true
+  for _ in {1..100}; do
+    [ -z "$(silk_proxy_pids agent)" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# Reads the resident proxy's handshake and asks it to warm its connections.
+# Succeeds only if a proxy answers with that token, and sets local_url.
+agent_proxy_answers() {
+  local port token code
+  [ -s "$AGENT_HANDSHAKE" ] || return 1
+  read -r port token < "$AGENT_HANDSHAKE" || return 1
+  [[ "$port" =~ ^[0-9]+$ && "$token" =~ ^[0-9a-f]{64}$ ]] || return 1
+  code="$(/usr/bin/curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 2 \
+    -b "silk_local_access=$token" "http://127.0.0.1:$port/__silk__/warm" 2>/dev/null || true)"
+  [ "$code" = "200" ] || return 1
+  local_url="http://127.0.0.1:$port/__silk__/$token"
+  return 0
+}
+
+# Uses the resident proxy when there is one. The warm-up call in
+# agent_proxy_answers lets it rebuild its connections while the browser
+# starts.
+attach_agent_proxy() {
+  local_url=""
+  [ "${SILK_CHAT_DISABLE_LOCAL_UI:-}" != "1" ] || return 1
+  [ "${SILK_CHAT_DISABLE_AGENT:-}" != "1" ] || return 1
+  agent_loaded || return 1
+
+  if [ -f "$AGENT_HANDSHAKE" ] &&
+    { [ "$PROXY_BIN" -nt "$AGENT_HANDSHAKE" ] || [ "$0" -nt "$AGENT_HANDSHAKE" ]; }; then
+    # An update replaced the proxy or this script after the agent started.
+    log_proxy "launch: restarting the resident proxy after an update"
+    rm -f "$AGENT_HANDSHAKE"
+    /bin/launchctl kickstart -k "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 || true
+  elif ! agent_proxy_answers; then
+    /bin/launchctl kickstart "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 || true
+  else
+    return 0
+  fi
+  for _ in {1..50}; do
+    if agent_proxy_answers; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  # Never leave it running next to the proxy this launch starts instead.
+  log_proxy "launch: the resident proxy did not answer; stopping it"
+  stop_agent_proxy || log_proxy "launch: the resident proxy did not stop"
+  return 1
+}
+
+# The LaunchAgent's entry point: become the proxy. launchd restarts it if it
+# crashes; a clean exit (not set up, nothing to run) is left alone.
+run_agent() {
+  local onion_value browser_bin browser_dir app_dir
+  onion_value="$(normalize_onion "$(cat "$ONION_FILE" 2>/dev/null || true)")"
+  if ! valid_onion "$onion_value"; then
+    log_proxy "agent: Silk Chat is not set up; not starting"
+    exit 0
+  fi
+  if [ ! -x "$PROXY_BIN" ] || [ ! -f "$WEBUI_DIR/index.html" ]; then
+    log_proxy "agent: the proxy or the frontend is missing; not starting"
+    exit 0
+  fi
+  if [ ! -x "$TOR_BINARY" ]; then
+    browser_bin="$(find_tor_browser)" || {
+      log_proxy "agent: Tor Browser is not installed; not starting"
+      exit 0
+    }
+    app_dir="$(cd "$(dirname "$browser_bin")/../.." && pwd)"
+    browser_dir="$(cd "$(dirname "$browser_bin")" && pwd -P)"
+    TOR_BINARY="$browser_dir/Tor/tor"
+    TOR_GEOIP_DIR="${TOR_GEOIP_DIR:-$app_dir/Contents/Resources/TorBrowser/Tor}"
+  fi
+  if [ ! -x "$TOR_BINARY" ]; then
+    # Without its own Tor there is nothing to keep connected.
+    log_proxy "agent: Tor Browser's tor is missing; not starting"
+    exit 0
+  fi
+
+  # An app started before the agent (for example, open while installing)
+  # runs its own proxy on the same device vault; wait for it to quit.
+  local waited=false
+  while [ -n "$(silk_proxy_pids app)" ]; do
+    if [ "$waited" = false ]; then
+      log_proxy "agent: Silk Chat's own proxy is running; starting when it exits"
+      waited=true
+    fi
+    sleep "${SILK_CHAT_AGENT_WAIT_INTERVAL:-2}"
+  done
+
+  mkdir -p "$TOR_DATA" "$(dirname "$AGENT_HANDSHAKE")" 2>/dev/null || true
+  chmod 700 "$TOR_DATA" 2>/dev/null || true
+  seed_owned_tor
+  rm -f "$AGENT_HANDSHAKE"
+  local proxy_args=(
+    --static-dir "$WEBUI_DIR"
+    --onion-file "$ONION_FILE"
+    --handshake "$AGENT_HANDSHAKE"
+    --tor-binary "$TOR_BINARY"
+    --tor-data "$TOR_DATA"
+    --tor-socks-timeout 20s
+  )
+  if [ -d "$TOR_GEOIP_DIR" ]; then
+    proxy_args+=(--tor-geoip-dir "$TOR_GEOIP_DIR")
+  fi
+  log_proxy "agent: starting the resident proxy"
+  export SILK_CHAT_PROXY_LOG="$PROXY_LOG"
+  exec "$PROXY_BIN" "${proxy_args[@]}" >/dev/null 2>&1
+}
+
 start_local_proxy() {
   local_handshake="${TMPDIR:-/tmp}/silk-chat-proxy.$$"
   local_url=""
@@ -287,12 +505,30 @@ start_local_proxy() {
   [ -x "$PROXY_BIN" ] && [ -f "$WEBUI_DIR/index.html" ] || return 1
 
   rm -f "$local_handshake"
+  mkdir -p "$TOR_DATA" 2>/dev/null || true
+  chmod 700 "$TOR_DATA" 2>/dev/null || true
+  seed_owned_tor
   log_proxy "launch: starting local proxy"
-  SILK_CHAT_PROXY_LOG="$PROXY_LOG" "$PROXY_BIN" \
-    --static-dir "$WEBUI_DIR" \
-    --onion-file "$ONION_FILE" \
-    --handshake "$local_handshake" \
-    --tor-socks 127.0.0.1:9150 >/dev/null 2>&1 &
+  local proxy_args=(
+    --static-dir "$WEBUI_DIR"
+    --onion-file "$ONION_FILE"
+    --handshake "$local_handshake"
+  )
+  if [ -x "$TOR_BINARY" ]; then
+    log_proxy "launch: using Tor Browser's Tor as the owned transport"
+    proxy_args+=(
+      --tor-binary "$TOR_BINARY"
+      --tor-data "$TOR_DATA"
+      --tor-socks-timeout 20s
+    )
+    if [ -d "$TOR_GEOIP_DIR" ]; then
+      proxy_args+=(--tor-geoip-dir "$TOR_GEOIP_DIR")
+    fi
+  else
+    log_proxy "launch: owned Tor unavailable; using Tor Browser's SOCKS"
+    proxy_args+=(--tor-socks 127.0.0.1:9150)
+  fi
+  SILK_CHAT_PROXY_LOG="$PROXY_LOG" "$PROXY_BIN" "${proxy_args[@]}" >/dev/null 2>&1 &
   local_proxy_pid=$!
 
   for _ in {1..50}; do
@@ -841,6 +1077,23 @@ if [ "$PLAN_UPDATE" = true ]; then
   exit $?
 fi
 
+if [ "$AGENT" = true ]; then
+  run_agent
+fi
+
+if [ "$AGENT_ATTACH" = true ]; then
+  # Support and test entry point: reach the resident proxy the way a launch
+  # does (starting or restarting it if needed) and say whether it answered.
+  # The access token is never printed.
+  if agent_loaded; then printf 'agent_loaded=1\n'; else printf 'agent_loaded=0\n'; fi
+  if attach_agent_proxy; then
+    printf 'attached=1\n'
+    exit 0
+  fi
+  printf 'attached=0\n'
+  exit 1
+fi
+
 if [ "$UPDATE_ONLY" = true ]; then
   mkdir -p "$(dirname "$UPDATE_LOG")" 2>/dev/null || true
   exec >> "$UPDATE_LOG" 2>&1
@@ -874,6 +1127,8 @@ browser="$(find_tor_browser)" || {
 }
 browser_app="$(cd "$(dirname "$browser")/../.." && pwd)"
 browser_real="$(cd "$(dirname "$browser")" && pwd -P)/$(basename "$browser")"
+TOR_BINARY="${TOR_BINARY:-$(dirname "$browser_real")/Tor/tor}"
+TOR_GEOIP_DIR="${TOR_GEOIP_DIR:-$browser_app/Contents/Resources/TorBrowser/Tor}"
 TOR_PROCESS_PATTERN="$browser_real"
 TOR_TOR_PATTERN="$(dirname "$browser_real")/Tor/tor"
 
@@ -898,7 +1153,10 @@ apply_pending_resources
 
 status_set opening "Opening Silk Chat…"
 
-if start_local_proxy; then
+if attach_agent_proxy; then
+  log_proxy "launch: using the resident proxy"
+  browser_url="$local_url"
+elif start_local_proxy; then
   log_proxy "launch: local proxy ready"
   browser_url="$local_url"
 else
