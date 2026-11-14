@@ -45,6 +45,10 @@ browser_pid=""
 open_pid=""
 
 LAUNCHER_SIGNING_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILvj4ZhAL+Jve263cPzibOBvqrSHLf20FqJ5nev1l/dq"
+# Updates come from the public GitHub release over the normal internet, not
+# Tor (docs/security.md, "App updates"). The files are public, the manifest is
+# signed and every file is checked against it, and no request carries a
+# cookie, token, account or onion address.
 UPDATE_BASE_URL="${SILK_CHAT_UPDATE_BASE_URL:-https://github.com/patrickkkim/silk-chat-launcher/releases/download/launcher-latest}"
 UPDATE_CHECK_FILE="${SILK_CHAT_UPDATE_CHECK_FILE:-$HOME/.config/silk-chat/last-launcher-check}"
 UPDATE_VERSION_FILE="${SILK_CHAT_UPDATE_VERSION_FILE:-$HOME/.config/silk-chat/launcher-version}"
@@ -601,14 +605,23 @@ log_proxy() {
   chmod 600 "$PROXY_LOG" 2>/dev/null || true
 }
 
+# The native panel (launcher.m) shows title, a progress bar and detail when
+# progress= is present: 0-100, or -1 for an animated bar while the size or the
+# length of a step is unknown. Panels from before that read only message, so
+# message carries the same text on one line.
 status_write() {
-  local phase="$1" message="$2" visible="$3" tmp
+  local phase="$1" message="$2" visible="$3" title="${4-}" detail="${5-}" progress="${6-}" tmp
   mkdir -p "$(dirname "$STATUS_FILE")" 2>/dev/null || return 0
   tmp="$STATUS_FILE.$$"
   {
     printf 'phase=%s\n' "$phase"
     printf 'message=%s\n' "$message"
     printf 'visible=%s\n' "$visible"
+    if [ -n "$progress" ]; then
+      printf 'title=%s\n' "$title"
+      printf 'detail=%s\n' "$detail"
+      printf 'progress=%s\n' "$progress"
+    fi
     printf 'updated=%s\n' "$(date +%s)"
   } > "$tmp" 2>/dev/null || {
     rm -f "$tmp" 2>/dev/null || true
@@ -620,6 +633,15 @@ status_write() {
 
 status_set() {
   status_write "$1" "$2" 1
+}
+
+# Every update phase shows a bar and a line of detail.
+status_progress() {
+  local phase="$1" title="$2" detail="$3" progress="$4" message="$2"
+  if [ -n "$detail" ]; then
+    message="$title — $detail"
+  fi
+  status_write "$phase" "$message" 1 "$title" "$detail" "$progress"
 }
 
 status_hide() {
@@ -815,12 +837,6 @@ self_update_due() {
   return 0
 }
 
-set_update_base_url() {
-  if [ -n "$onion" ] && [ -z "${SILK_CHAT_UPDATE_BASE_URL:-}" ]; then
-    UPDATE_BASE_URL="http://$onion/static/updates/macos"
-  fi
-}
-
 wait_for_socks() {
   for _ in {1..60}; do
     if /usr/bin/nc -z 127.0.0.1 9150 >/dev/null 2>&1; then
@@ -831,6 +847,151 @@ wait_for_socks() {
   return 1
 }
 
+# Update requests: HTTPS only (redirects too), straight to GitHub without any
+# proxy, and no ~/.curlrc (-q must come first), so nothing can add a cookie,
+# header or proxy to them.
+update_curl() {
+  curl -q -fsSL --proto '=https' --proto-redir '=https' --noproxy '*' \
+    --connect-timeout 15 "$@"
+}
+
+# "740 KB", "12.3 MB": decimal units, as Finder shows sizes.
+format_size() {
+  local bytes="$1"
+  if [ "$bytes" -lt 1000000 ]; then
+    printf '%d KB' "$(((bytes + 999) / 1000))"
+  else
+    printf '%d.%d MB' "$((bytes / 1000000))" "$(((bytes % 1000000) / 100000))"
+  fi
+}
+
+format_time_left() {
+  local seconds="$1"
+  if [ "$seconds" -lt 1 ]; then
+    seconds=1
+  fi
+  if [ "$seconds" -lt 60 ]; then
+    printf 'about %d s left' "$seconds"
+  else
+    printf 'about %d min left' "$(((seconds + 59) / 60))"
+  fi
+}
+
+manifest_number() {
+  local value
+  value="$(sed -n "s/^$1=//p" "$2" | head -1)"
+  case "$value" in
+    ''|*[!0-9]*) printf '0\n' ;;
+    *) printf '%s\n' "$value" ;;
+  esac
+}
+
+# Downloads one release file while the status panel shows its bar, size, speed
+# and time left. A stall (under 4 KB/s for a minute) fails an attempt instead of
+# a fixed deadline, so a slow but moving download still finishes. expected is
+# the size from the signed manifest; without it the bar animates.
+fetch_update_file() {
+  local name="$1" out="$2" title="$3" expected="${4:-0}"
+  local pid size previous=0 previous_at now sample rate=0 progress=-1 detail
+  case "$expected" in
+    ''|*[!0-9]*) expected=0 ;;
+  esac
+  if [ "$expected" -gt 0 ]; then
+    progress=0
+  fi
+  rm -f "$out"
+  status_progress downloading "$title" "Connecting to GitHub…" "$progress"
+  update_curl --speed-limit 4096 --speed-time 60 --max-time 3600 --retry 2 \
+    "$UPDATE_BASE_URL/$name" -o "$out" &
+  pid=$!
+  previous_at="$(date +%s)"
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 0.5
+    size=0
+    if [ -f "$out" ]; then
+      size="$(wc -c < "$out" 2>/dev/null | tr -d ' ')"
+    fi
+    case "$size" in
+      ''|*[!0-9]*) size=0 ;;
+    esac
+    now="$(date +%s)"
+    if [ "$now" -gt "$previous_at" ]; then
+      # A retry starts the file again; count that second as no progress.
+      sample=$(((size - previous) / (now - previous_at)))
+      if [ "$sample" -lt 0 ]; then
+        sample=0
+      fi
+      if [ "$rate" -eq 0 ]; then
+        rate="$sample"
+      else
+        rate=$(((rate * 2 + sample) / 3))
+      fi
+      previous="$size"
+      previous_at="$now"
+    fi
+    detail="$(format_size "$size")"
+    if [ "$expected" -gt 0 ]; then
+      progress=$((size * 100 / expected))
+      if [ "$progress" -gt 100 ]; then
+        progress=100
+      fi
+      detail="$detail of $(format_size "$expected")"
+    fi
+    if [ "$rate" -gt 0 ]; then
+      detail="$detail · $(format_size "$rate")/s"
+      if [ "$expected" -gt "$size" ]; then
+        detail="$detail · $(format_time_left $(((expected - size + rate - 1) / rate)))"
+      fi
+    fi
+    status_progress downloading "$title" "$detail" "$progress"
+  done
+  wait "$pid"
+}
+
+# The native app (Contents/MacOS/silk-chat) draws the status panel, so it is
+# updated too. A replacement must be the manifest's universal binary. It goes
+# in by rename, which leaves the running copy alone, and takes effect the next
+# time Silk Chat opens.
+wrapper_is_valid() {
+  local file="$1" want="$2" kind
+  if [ "$(shasum -a 256 "$file" | awk '{print $1}')" != "$want" ]; then
+    log_update "app hash does not match the manifest"
+    return 1
+  fi
+  kind="$(/usr/bin/file -b "$file" 2>/dev/null || true)"
+  case "$kind" in
+    *Mach-O*universal*|*universal*Mach-O*) ;;
+    *)
+      log_update "downloaded app is not a universal Mach-O binary"
+      return 1
+      ;;
+  esac
+  case "$kind" in
+    *arm64*) ;;
+    *)
+      log_update "downloaded app has no arm64 code"
+      return 1
+      ;;
+  esac
+  case "$kind" in
+    *x86_64*) ;;
+    *)
+      log_update "downloaded app has no x86_64 code"
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+install_wrapper_file() {
+  local new="$1" target="$2" staged
+  staged="$(dirname "$target")/.silk-chat.new.$$"
+  if cp "$new" "$staged" && chmod 755 "$staged" && mv -f "$staged" "$target"; then
+    return 0
+  fi
+  rm -f "$staged" 2>/dev/null || true
+  return 1
+}
 
 update_launcher() {
   local resources_dir
@@ -852,17 +1013,12 @@ update_launcher() {
     status_shown=0
     trap 'rm -rf "$work"; if [ "$status_shown" = 1 ]; then status_hide; fi' EXIT
 
-    wait_for_socks || {
-      log_update "Tor SOCKS did not become ready"
-      exit 0
-    }
-
-    curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 45 --retry 2 \
+    update_curl --max-time 45 --retry 2 \
       "$UPDATE_BASE_URL/manifest.txt" -o "$work/manifest.txt" || {
       log_update "manifest download failed"
       exit 0
     }
-    curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 45 --retry 2 \
+    update_curl --max-time 45 --retry 2 \
       "$UPDATE_BASE_URL/manifest.txt.sig" -o "$work/manifest.txt.sig" || {
       log_update "signature download failed"
       exit 0
@@ -884,6 +1040,11 @@ update_launcher() {
     resources_version="$(sed -n 's/^resources_version=//p' "$work/manifest.txt" | head -1)"
     webui_sha="$(sed -n 's/^webui_sha256=//p' "$work/manifest.txt" | head -1)"
     proxy_sha="$(sed -n 's/^proxy_sha256=//p' "$work/manifest.txt" | head -1)"
+    wrapper_sha="$(sed -n 's/^wrapper_sha256=//p' "$work/manifest.txt" | head -1)"
+    launcher_size="$(manifest_number launcher_size "$work/manifest.txt")"
+    webui_size="$(manifest_number webui_size "$work/manifest.txt")"
+    proxy_size="$(manifest_number proxy_size "$work/manifest.txt")"
+    wrapper_size="$(manifest_number wrapper_size "$work/manifest.txt")"
 
     case "$version" in
       ''|*[!0-9]*) log_update "manifest version is invalid"; exit 0 ;;
@@ -907,6 +1068,10 @@ update_launcher() {
         break
       fi
     done
+    if [ -n "$wrapper_sha" ] && ! valid_sha "$wrapper_sha"; then
+      log_update "app manifest hash is invalid"
+      wrapper_sha=""
+    fi
 
     current=0
     if [ -f "$UPDATE_VERSION_FILE" ]; then
@@ -914,6 +1079,13 @@ update_launcher() {
       case "$current" in
         ''|*[!0-9]*) current=0 ;;
       esac
+    fi
+    # The GitHub release goes live after the server deploy, so an install that
+    # took this launcher from the onion copy can briefly see an older release.
+    # Never move resources backwards to it.
+    if [ "$version" -lt "$current" ]; then
+      log_update "the published release $version is older than this install ($current); waiting"
+      exit 0
     fi
     launcher_needed=0
     if [ "$version" -gt "$current" ]; then
@@ -942,21 +1114,31 @@ update_launcher() {
       resources_needed=1
     fi
 
-    if [ "$launcher_needed" -eq 0 ] && [ "$resources_needed" -eq 0 ]; then
+    wrapper_needed=0
+    wrapper_path="$resources_dir/../MacOS/silk-chat"
+    if [ -n "$wrapper_sha" ] && [ -f "$wrapper_path" ] &&
+      [ "$(shasum -a 256 "$wrapper_path" | awk '{print $1}')" != "$wrapper_sha" ]; then
+      wrapper_needed=1
+    fi
+
+    if [ "$launcher_needed" -eq 0 ] && [ "$resources_needed" -eq 0 ] &&
+      [ "$wrapper_needed" -eq 0 ]; then
       log_update "launcher and resources are up to date"
       exit 0
     fi
 
     status_shown=1
-    status_set downloading "Downloading the Silk Chat update…"
     launcher_updated=0
+    reopen_needed=0
 
     if [ "$launcher_needed" -eq 1 ]; then
-      curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 45 --retry 2 \
-        "$UPDATE_BASE_URL/launch.command" -o "$work/launch.command" || {
+      if ! fetch_update_file launch.command "$work/launch.command" \
+        "Downloading the Silk Chat launcher" "$launcher_size"; then
         log_update "launcher download failed"
-      }
+        rm -f "$work/launch.command"
+      fi
       if [ -f "$work/launch.command" ]; then
+        status_progress downloading "Checking the launcher" "Comparing it with the signed manifest" 100
         actual="$(shasum -a 256 "$work/launch.command" | awk '{print $1}')"
         if [ "$actual" != "$sha" ]; then
           log_update "launcher hash does not match the manifest"
@@ -968,6 +1150,7 @@ update_launcher() {
             mv "$staged" "$resources_dir/launch.command"; then
             record_launcher_version "$version"
             launcher_updated=1
+            reopen_needed=1
             log_update "launcher updated to version $version"
           else
             rm -f "$staged" 2>/dev/null || true
@@ -989,9 +1172,26 @@ update_launcher() {
       exit $?
     fi
 
+    if [ "$wrapper_needed" -eq 1 ]; then
+      if ! fetch_update_file silk-chat "$work/silk-chat" \
+        "Downloading the Silk Chat app" "$wrapper_size"; then
+        log_update "app download failed"
+      else
+        status_progress downloading "Checking the app" "Comparing it with the signed manifest" 100
+        if wrapper_is_valid "$work/silk-chat" "$wrapper_sha"; then
+          if install_wrapper_file "$work/silk-chat" "$wrapper_path"; then
+            reopen_needed=1
+            log_update "app updated"
+          else
+            log_update "could not replace the app"
+          fi
+        fi
+      fi
+    fi
+
     if [ "$resources_needed" -eq 0 ]; then
-      if [ "$launcher_updated" -eq 1 ]; then
-        status_set downloaded "Silk Chat update ready — reopen to finish."
+      if [ "$reopen_needed" -eq 1 ]; then
+        status_progress downloaded "Silk Chat update ready" "Reopen Silk Chat to finish" 100
         sleep 3
       fi
       exit 0
@@ -999,13 +1199,20 @@ update_launcher() {
 
     if pending_is_current "$resources_version" "$webui_sha" "$proxy_sha" "$PENDING_RESOURCES"; then
       log_update "resources already staged"
-      if [ "$launcher_updated" -eq 1 ]; then
-        status_set downloaded "Silk Chat update ready — reopen to finish."
+      if [ "$reopen_needed" -eq 1 ]; then
+        status_progress downloaded "Silk Chat update ready" "Reopen Silk Chat to finish" 100
         sleep 3
       fi
       exit 0
     fi
 
+    # Resources must match the server's Open WebUI version, and only the onion
+    # can say which one runs: this request alone still goes through Tor.
+    status_progress downloading "Checking the server version" "Asking the Silk Chat server over Tor" -1
+    if ! wait_for_socks; then
+      log_update "Tor SOCKS did not become ready; resources not staged"
+      exit 0
+    fi
     config_json="$(curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 30 \
       "http://$onion/api/config" 2>/dev/null || true)"
     current_server="$(printf '%s' "$config_json" |
@@ -1022,16 +1229,17 @@ update_launcher() {
     log_update "updating resources for $server_version (webui=$webui_needed proxy=$proxy_needed version=$version_needed)"
 
     if [ "$webui_needed" -eq 1 ]; then
-      status_set downloading "Downloading the Silk Chat frontend…"
-      curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 600 --retry 2 \
-        "$UPDATE_BASE_URL/webui.tar.gz" -o "$work/webui.tar.gz" || {
+      fetch_update_file webui.tar.gz "$work/webui.tar.gz" \
+        "Downloading the Silk Chat frontend" "$webui_size" || {
         log_update "frontend download failed"
         exit 0
       }
+      status_progress downloading "Checking the frontend" "Comparing it with the signed manifest" 100
       if [ "$(shasum -a 256 "$work/webui.tar.gz" | awk '{print $1}')" != "$webui_sha" ]; then
         log_update "frontend hash does not match the manifest"
         exit 0
       fi
+      status_progress installing "Unpacking the frontend" "Getting it ready for the next launch" -1
       mkdir -p "$work/webui"
       tar -xzf "$work/webui.tar.gz" -C "$work/webui" || {
         log_update "frontend archive could not be extracted"
@@ -1050,12 +1258,12 @@ update_launcher() {
     printf '%s\n' "$webui_sha" > "$work/webui/.silk-bundle-sha256"
 
     if [ "$proxy_needed" -eq 1 ]; then
-      status_set downloading "Downloading the Silk Chat proxy…"
-      curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 300 --retry 2 \
-        "$UPDATE_BASE_URL/silk-chat-proxy" -o "$work/silk-chat-proxy" || {
+      fetch_update_file silk-chat-proxy "$work/silk-chat-proxy" \
+        "Downloading the Silk Chat proxy" "$proxy_size" || {
         log_update "proxy download failed"
         exit 0
       }
+      status_progress downloading "Checking the proxy" "Comparing it with the signed manifest" 100
       if [ "$(shasum -a 256 "$work/silk-chat-proxy" | awk '{print $1}')" != "$proxy_sha" ]; then
         log_update "proxy hash does not match the manifest"
         exit 0
@@ -1073,8 +1281,8 @@ update_launcher() {
     chmod 755 "$work/silk-chat-proxy"
 
     if [ "$version_needed" -eq 1 ]; then
-      curl -fsSL --socks5-hostname 127.0.0.1:9150 --connect-timeout 15 --max-time 45 --retry 2 \
-        "$UPDATE_BASE_URL/webui-version.txt" -o "$work/webui-version.txt" || {
+      fetch_update_file webui-version.txt "$work/webui-version.txt" \
+        "Downloading the frontend version" 0 || {
         log_update "frontend version download failed"
         exit 0
       }
@@ -1093,6 +1301,7 @@ update_launcher() {
       fi
     fi
 
+    status_progress installing "Staging the update" "Getting it ready for the next launch" -1
     pending_tmp="$PENDING_RESOURCES.$$"
     rm -rf "$pending_tmp"
     if ! mkdir -p "$pending_tmp"; then
@@ -1113,7 +1322,7 @@ update_launcher() {
       exit 0
     fi
     log_update "resources staged for the next launch"
-    status_set downloaded "Silk Chat update ready — it will install next time."
+    status_progress downloaded "Silk Chat update ready" "It installs the next time Silk Chat opens" 100
     sleep 3
   )
 }
@@ -1144,7 +1353,6 @@ if [ "$UPDATE_ONLY" = true ]; then
   mkdir -p "$(dirname "$UPDATE_LOG")" 2>/dev/null || true
   exec >> "$UPDATE_LOG" 2>&1
   onion="$(normalize_onion "$(cat "$ONION_FILE" 2>/dev/null || true)")"
-  set_update_base_url
   update_launcher
   exit 0
 fi
@@ -1159,7 +1367,6 @@ if ! valid_onion "$onion"; then
   say_error "Silk Chat is not set up. Run the Silk Chat installer once, then open the app again."
   exit 1
 fi
-set_update_base_url
 
 if [ ! -d "$TOR_PROFILE" ] || [ ! -f "$TOR_PROFILE/user.js" ]; then
   say_error "Silk Chat is not set up. Run the Silk Chat installer once, then open the app again."
@@ -1193,7 +1400,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 if [ -f "$PENDING_RESOURCES/webui/index.html" ] && [ -x "$PENDING_RESOURCES/silk-chat-proxy" ]; then
-  status_set installing "Installing the Silk Chat update…"
+  status_progress installing "Installing the Silk Chat update" "Replacing the frontend and proxy" -1
 fi
 apply_pending_resources
 
