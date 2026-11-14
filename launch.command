@@ -35,6 +35,9 @@ TOR_DATA="${SILK_CHAT_TOR_DATA:-$HOME/.config/silk-chat/tor}"
 # app is opened. It leaves its port and access token here for the launcher.
 AGENT_LABEL="${SILK_CHAT_AGENT_LABEL:-local.silk-chat.agent}"
 AGENT_HANDSHAKE="${SILK_CHAT_AGENT_HANDSHAKE:-$HOME/.config/silk-chat/agent-handshake}"
+# What the resident proxy was started from (the proxy's and this script's
+# SHA-256), so a launch restarts it only when an update changed either one.
+AGENT_STAMP="${SILK_CHAT_AGENT_STAMP:-$AGENT_HANDSHAKE.build}"
 local_proxy_pid=""
 local_handshake=""
 local_url=""
@@ -353,6 +356,36 @@ agent_loaded() {
   /bin/launchctl print "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1
 }
 
+file_sha() {
+  /usr/bin/shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+}
+
+# Records what the resident proxy is about to run (see AGENT_STAMP).
+write_agent_stamp() {
+  local tmp="$AGENT_STAMP.tmp.$$"
+  if printf 'proxy_sha256=%s\nlauncher_sha256=%s\n' "$(file_sha "$PROXY_BIN")" "$(file_sha "$0")" \
+    > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$AGENT_STAMP" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+# True when the resident proxy runs another proxy or launcher than the ones
+# installed now. Compared by content: the updater used to rewrite files whose
+# build number rose with every push even when nothing in them changed, and a
+# timestamp check then restarted the proxy, and its Tor, cold on every open.
+agent_outdated() {
+  [ -f "$AGENT_HANDSHAKE" ] || return 1
+  if [ ! -f "$AGENT_STAMP" ]; then
+    # Started by an older launcher, which recorded nothing: timestamps, once.
+    [ "$PROXY_BIN" -nt "$AGENT_HANDSHAKE" ] || [ "$0" -nt "$AGENT_HANDSHAKE" ]
+    return
+  fi
+  [ "$(sed -n 's/^proxy_sha256=//p' "$AGENT_STAMP" | head -1)" != "$(file_sha "$PROXY_BIN")" ] ||
+    [ "$(sed -n 's/^launcher_sha256=//p' "$AGENT_STAMP" | head -1)" != "$(file_sha "$0")" ]
+}
+
 # Running proxies of this app bundle that use the device vault: "agent" lists
 # the resident one, "app" the ones a launcher started itself. The vault's
 # device token rotates on every exchange, and a token another proxy rotated
@@ -414,11 +447,10 @@ attach_agent_proxy() {
   [ "${SILK_CHAT_DISABLE_AGENT:-}" != "1" ] || return 1
   agent_loaded || return 1
 
-  if [ -f "$AGENT_HANDSHAKE" ] &&
-    { [ "$PROXY_BIN" -nt "$AGENT_HANDSHAKE" ] || [ "$0" -nt "$AGENT_HANDSHAKE" ]; }; then
-    # An update replaced the proxy or this script after the agent started.
+  if agent_outdated; then
+    # An update changed the proxy or this script after the agent started.
     log_proxy "launch: restarting the resident proxy after an update"
-    rm -f "$AGENT_HANDSHAKE"
+    rm -f "$AGENT_HANDSHAKE" "$AGENT_STAMP"
     /bin/launchctl kickstart -k "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 || true
   elif ! agent_proxy_answers; then
     /bin/launchctl kickstart "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 || true
@@ -493,6 +525,7 @@ run_agent() {
     proxy_args+=(--tor-geoip-dir "$TOR_GEOIP_DIR")
   fi
   log_proxy "agent: starting the resident proxy"
+  write_agent_stamp
   export SILK_CHAT_PROXY_LOG="$PROXY_LOG"
   exec "$PROXY_BIN" "${proxy_args[@]}" >/dev/null 2>&1
 }
@@ -756,6 +789,13 @@ apply_pending_resources() {
   log_update "frontend and proxy updated from staged release"
 }
 
+record_launcher_version() {
+  mkdir -p "$(dirname "$UPDATE_VERSION_FILE")" 2>/dev/null || true
+  printf '%s\n' "$1" > "$UPDATE_VERSION_FILE.tmp.$$" 2>/dev/null || return 0
+  chmod 600 "$UPDATE_VERSION_FILE.tmp.$$" 2>/dev/null || true
+  mv "$UPDATE_VERSION_FILE.tmp.$$" "$UPDATE_VERSION_FILE" 2>/dev/null || true
+}
+
 self_update_due() {
   local now last=0
   now="$(date +%s)"
@@ -876,7 +916,16 @@ update_launcher() {
       esac
     fi
     launcher_needed=0
-    [ "$version" -gt "$current" ] && launcher_needed=1
+    if [ "$version" -gt "$current" ]; then
+      if [ "$(file_sha "$resources_dir/launch.command")" = "$sha" ]; then
+        # Every push to main raises the build number. When the launcher in it
+        # is the one installed, note the number and leave the file alone.
+        record_launcher_version "$version"
+        log_update "launcher unchanged in version $version"
+      else
+        launcher_needed=1
+      fi
+    fi
 
     webui_needed=0
     proxy_needed=0
@@ -917,10 +966,7 @@ update_launcher() {
           staged="$resources_dir/.launch.command.new.$$"
           if cp "$work/launch.command" "$staged" && chmod 755 "$staged" &&
             mv "$staged" "$resources_dir/launch.command"; then
-            mkdir -p "$(dirname "$UPDATE_VERSION_FILE")" 2>/dev/null || true
-            printf '%s\n' "$version" > "$UPDATE_VERSION_FILE.tmp.$$"
-            chmod 600 "$UPDATE_VERSION_FILE.tmp.$$"
-            mv "$UPDATE_VERSION_FILE.tmp.$$" "$UPDATE_VERSION_FILE" 2>/dev/null || true
+            record_launcher_version "$version"
             launcher_updated=1
             log_update "launcher updated to version $version"
           else
