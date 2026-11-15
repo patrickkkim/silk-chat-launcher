@@ -54,6 +54,8 @@ UPDATE_CHECK_FILE="${SILK_CHAT_UPDATE_CHECK_FILE:-$HOME/.config/silk-chat/last-l
 UPDATE_VERSION_FILE="${SILK_CHAT_UPDATE_VERSION_FILE:-$HOME/.config/silk-chat/launcher-version}"
 UPDATE_LOG="${SILK_CHAT_UPDATE_LOG:-$HOME/Library/Logs/Silk Chat/updater.log}"
 PROXY_LOG="${SILK_CHAT_PROXY_LOG:-$HOME/Library/Logs/Silk Chat/proxy.log}"
+STATE_KEY_ITEM="${SILK_CHAT_KEYCHAIN_ITEM:-silk-chat.local-state}"
+STATE_KEY_ACCOUNT="${SILK_CHAT_KEYCHAIN_ACCOUNT:-$(id -un)}"
 SESSION_FILE="${SILK_CHAT_SESSION_FILE:-$HOME/.config/silk-chat/session}"
 PENDING_RESOURCES="${SILK_CHAT_PENDING_RESOURCES:-$HOME/.config/silk-chat/pending-resources}"
 ROLLBACK_RESOURCES="${SILK_CHAT_ROLLBACK_RESOURCES:-$HOME/.config/silk-chat/rollback-resources}"
@@ -473,6 +475,27 @@ attach_agent_proxy() {
   return 1
 }
 
+# The core seals the device vault, the response cache and chat images with a
+# key that never sits next to them. The login keychain holds the root key; the
+# proxy receives it on fd 3, not in argv or the environment (both are visible
+# to every process of the user). SILK_CHAT_STATE_KEY exists for tests only.
+local_state_key() {
+  local key="${SILK_CHAT_STATE_KEY:-}"
+  if [ -z "$key" ]; then
+    key="$(/usr/bin/security find-generic-password -s "$STATE_KEY_ITEM" -a "$STATE_KEY_ACCOUNT" -w 2>/dev/null || true)"
+  fi
+  if [ -z "$key" ]; then
+    key="$(/usr/bin/od -An -N32 -tx1 /dev/urandom 2>/dev/null | /usr/bin/tr -d ' \n' || true)"
+    [ "${#key}" -eq 64 ] || return 1
+    /usr/bin/security add-generic-password -U -s "$STATE_KEY_ITEM" -a "$STATE_KEY_ACCOUNT" -w "$key" -A >/dev/null 2>&1 || return 1
+  fi
+  case "$key" in
+    *[!0-9a-f]* | "") return 1 ;;
+  esac
+  [ "${#key}" -eq 64 ] || return 1
+  printf '%s\n' "$key"
+}
+
 # The LaunchAgent's entry point: become the proxy. launchd restarts it if it
 # crashes; a clean exit (not set up, nothing to run) is left alone.
 run_agent() {
@@ -529,9 +552,14 @@ run_agent() {
     proxy_args+=(--tor-geoip-dir "$TOR_GEOIP_DIR")
   fi
   log_proxy "agent: starting the resident proxy"
+  if ! local_state_key >/dev/null 2>&1; then
+    log_proxy "agent: the local state key is unavailable; not starting"
+    exit 0
+  fi
+  proxy_args+=(--state-key-fd 3)
   write_agent_stamp
   export SILK_CHAT_PROXY_LOG="$PROXY_LOG"
-  exec "$PROXY_BIN" "${proxy_args[@]}" >/dev/null 2>&1
+  exec "$PROXY_BIN" "${proxy_args[@]}" 3< <(local_state_key) >/dev/null 2>&1
 }
 
 start_local_proxy() {
@@ -546,10 +574,15 @@ start_local_proxy() {
   chmod 700 "$TOR_DATA" 2>/dev/null || true
   seed_owned_tor
   log_proxy "launch: starting local proxy"
+  if ! local_state_key >/dev/null 2>&1; then
+    log_proxy "launch: the local state key is unavailable"
+    return 1
+  fi
   local proxy_args=(
     --static-dir "$WEBUI_DIR"
     --onion-file "$ONION_FILE"
     --handshake "$local_handshake"
+    --state-key-fd 3
   )
   if [ -x "$TOR_BINARY" ]; then
     log_proxy "launch: using Tor Browser's Tor as the owned transport"
@@ -565,7 +598,7 @@ start_local_proxy() {
     log_proxy "launch: owned Tor unavailable; using Tor Browser's SOCKS"
     proxy_args+=(--tor-socks 127.0.0.1:9150)
   fi
-  SILK_CHAT_PROXY_LOG="$PROXY_LOG" "$PROXY_BIN" "${proxy_args[@]}" >/dev/null 2>&1 &
+  SILK_CHAT_PROXY_LOG="$PROXY_LOG" "$PROXY_BIN" "${proxy_args[@]}" 3< <(local_state_key) >/dev/null 2>&1 &
   local_proxy_pid=$!
 
   for _ in {1..50}; do
@@ -648,14 +681,38 @@ status_hide() {
   status_write "idle" "" 0
 }
 
+status_phase() {
+  sed -n 's/^phase=//p' "$STATUS_FILE" 2>/dev/null | head -1
+}
+
 status_is_update_phase() {
   local phase
   [ -f "$STATUS_FILE" ] || return 1
-  phase="$(sed -n 's/^phase=//p' "$STATUS_FILE" 2>/dev/null | head -1)"
+  phase="$(status_phase)"
   case "$phase" in
     downloading|installing|downloaded) return 0 ;;
   esac
   return 1
+}
+
+# A launcher killed between writing an update phase and hiding it leaves the
+# status panel up until the next launch. Checks run one at a time and a single
+# download is capped at 600 s per attempt, so an update phase this old has no
+# writer left and the next check clears it.
+stale_update_status=1800
+
+status_clear_stale() {
+  [ -f "$STATUS_FILE" ] || return 0
+  status_is_update_phase || return 0
+  local updated now
+  updated="$(sed -n 's/^updated=//p' "$STATUS_FILE" 2>/dev/null | head -1)"
+  case "$updated" in
+    '' | *[!0-9]*) updated=0 ;;
+  esac
+  now="$(date +%s)"
+  [ $((now - updated)) -ge "$stale_update_status" ] || return 0
+  log_update "cleared a stale update status ($(status_phase), $((now - updated))s old)"
+  status_hide
 }
 
 status_notice() {
@@ -1001,6 +1058,7 @@ update_launcher() {
     *) return 0 ;;
   esac
   [ -f "$resources_dir/../Info.plist" ] || return 0
+  status_clear_stale
   self_update_due || return 0
 
   if [ -f "$UPDATE_LOG" ] && [ "$(wc -c < "$UPDATE_LOG" 2>/dev/null || echo 0)" -gt 1048576 ]; then
